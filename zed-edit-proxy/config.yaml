@@ -1,8 +1,8 @@
 # Zed Edit Prediction Proxy Configuration
 
 # OpenAI-compatible API endpoint (vLLM, Ollama, LM Studio, etc.)
-openai_base_url: "http://localhost:1234/v1"  # LM Studio default
-# openai_base_url: "http://localhost:11434/v1"  # Ollama default  
+openai_base_url: "http://localhost:1234/v1" # LM Studio default
+# openai_base_url: "http://localhost:11434/v1"  # Ollama default
 # openai_base_url: "http://localhost:8000/v1"  # vLLM default
 
 # Model name to use - should match your local model
@@ -28,10 +28,10 @@ system_prompt: |
   Respond only with the predicted code changes, not explanations or commentary.
   If the input suggests a completion, provide the completion.
   If the input suggests a refactoring or edit, provide the modified code.
-  
+
   Examples of good responses:
   - For completing a function: return the function body
   - For fixing a bug: return the corrected code
   - For adding a feature: return the new code to add
-  
+
   Always match the existing code style, indentation, and naming conventions.

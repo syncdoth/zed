@@ -21,11 +21,13 @@ pip install -r requirements.txt
 ### 2. Configure Your Local Model Server
 
 #### For LM Studio:
+
 1. Download and install [LM Studio](https://lmstudio.ai/)
 2. Load a code-capable model (e.g., CodeLlama, DeepSeek Coder, etc.)
 3. Start the local server (default: http://localhost:1234)
 
 #### For Ollama:
+
 ```bash
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
@@ -38,6 +40,7 @@ ollama serve
 ```
 
 #### For vLLM:
+
 ```bash
 # Install vLLM
 pip install vllm
@@ -53,8 +56,8 @@ python -m vllm.entrypoints.openai.api_server \
 Edit `config.yaml` to match your setup:
 
 ```yaml
-openai_base_url: "http://localhost:1234/v1"  # Your local API endpoint
-model_name: "your-model-name"                # Your model name
+openai_base_url: "http://localhost:1234/v1" # Your local API endpoint
+model_name: "your-model-name" # Your model name
 max_tokens: 2048
 temperature: 0.1
 ```
@@ -85,14 +88,14 @@ zed
 
 ### config.yaml
 
-| Option | Description | Default |
-|--------|-------------|---------|
+| Option            | Description                             | Default                    |
+| ----------------- | --------------------------------------- | -------------------------- |
 | `openai_base_url` | Base URL for your OpenAI-compatible API | `http://localhost:1234/v1` |
-| `model_name` | Model name to use | `zed-industries/zeta` |
-| `max_tokens` | Maximum tokens to generate | `2048` |
-| `temperature` | Sampling temperature | `0.1` |
-| `timeout` | Request timeout in seconds | `30.0` |
-| `system_prompt` | System prompt for the model | See config.yaml |
+| `model_name`      | Model name to use                       | `zed-industries/zeta`      |
+| `max_tokens`      | Maximum tokens to generate              | `2048`                     |
+| `temperature`     | Sampling temperature                    | `0.1`                      |
+| `timeout`         | Request timeout in seconds              | `30.0`                     |
+| `system_prompt`   | System prompt for the model             | See config.yaml            |
 
 ### Command Line Options
 
@@ -108,11 +111,11 @@ Options:
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ZED_EDIT_PROXY_PORT` | Port to run on | `8080` |
-| `ZED_EDIT_PROXY_HOST` | Host to bind to | `127.0.0.1` |
-| `ZED_EDIT_PROXY_DEBUG` | Enable debug logging | `false` |
+| Variable               | Description          | Default     |
+| ---------------------- | -------------------- | ----------- |
+| `ZED_EDIT_PROXY_PORT`  | Port to run on       | `8080`      |
+| `ZED_EDIT_PROXY_HOST`  | Host to bind to      | `127.0.0.1` |
+| `ZED_EDIT_PROXY_DEBUG` | Enable debug logging | `false`     |
 
 ## API Endpoints
 
@@ -121,23 +124,25 @@ Options:
 Main endpoint that receives Zed's edit prediction requests and returns predictions.
 
 **Request Format** (matches Zed's PredictEditsBody):
+
 ```json
 {
   "outline": "optional string",
-  "input_events": "string - user input events", 
+  "input_events": "string - user input events",
   "input_excerpt": "string - code context around cursor",
   "speculated_output": "optional string",
   "can_collect_data": "boolean",
   "diagnostic_groups": "optional array",
   "git_info": {
     "head_sha": "optional string",
-    "remote_origin_url": "optional string", 
+    "remote_origin_url": "optional string",
     "remote_upstream_url": "optional string"
   }
 }
 ```
 
 **Response Format** (matches Zed's PredictEditsResponse):
+
 ```json
 {
   "request_id": "uuid",
@@ -156,24 +161,28 @@ Health check endpoint that tests connectivity to the OpenAI API.
 ## Example Configurations
 
 ### LM Studio (Default)
+
 ```yaml
 openai_base_url: "http://localhost:1234/v1"
 model_name: "deepseek-coder-6.7b-instruct"
 ```
 
 ### Ollama
+
 ```yaml
-openai_base_url: "http://localhost:11434/v1" 
+openai_base_url: "http://localhost:11434/v1"
 model_name: "codellama:7b-code"
 ```
 
 ### vLLM
+
 ```yaml
 openai_base_url: "http://localhost:8000/v1"
 model_name: "deepseek-ai/deepseek-coder-6.7b-instruct"
 ```
 
 ### Remote API
+
 ```yaml
 openai_base_url: "https://your-remote-api.com/v1"
 model_name: "your-model"
@@ -209,7 +218,7 @@ curl http://localhost:8080/health
 For best results with code prediction, use models specifically trained for code:
 
 - **DeepSeek Coder** (6.7B, 33B) - Excellent for code completion
-- **CodeLlama** (7B, 13B, 34B) - Good general code understanding  
+- **CodeLlama** (7B, 13B, 34B) - Good general code understanding
 - **StarCoder** (15B) - Strong at code generation
 - **WizardCoder** (15B, 34B) - Good for complex code tasks
 
