@@ -6,14 +6,15 @@ openai_base_url: "http://localhost:1234/v1" # LM Studio default
 # openai_base_url: "http://localhost:8000/v1"  # vLLM default
 
 # Model name to use - should match your local model
-model_name: "zed-industries/zeta"
+# model_name: "zed-industries/zeta"
 # model_name: "codellama:7b-code"  # Example for Ollama
 # model_name: "deepseek-coder:6.7b"  # Example for Ollama
+model_name: "zed-industries-zeta"
 
 # Model parameters
-max_tokens: 2048
+max_tokens: 300
 temperature: 0.1
-timeout: 30.0
+timeout: 10.0
 
 # System prompt for the model
 system_prompt: |

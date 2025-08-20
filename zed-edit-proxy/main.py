@@ -22,7 +22,7 @@ import argparse
 
 import yaml
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from httpx import AsyncClient, RequestError, HTTPStatusError
 
@@ -135,56 +135,25 @@ class RequestTransformer:
     @staticmethod
     def zed_to_openai(zed_request: PredictEditsBody) -> OpenAIRequest:
         """Transform Zed's PredictEditsBody to OpenAI chat completion format"""
+        prompt_template = """You are a code completion assistant and your task is to analyze user edits and then rewrite an excerpt that the user provides, suggesting the appropriate edits within the excerpt, taking into account the cursor location.
 
-        # Build context from the request
-        context_parts = []
+### User Edits:
 
-        # Add outline if provided
-        if zed_request.outline:
-            context_parts.append(f"Code outline:\n{zed_request.outline}")
+{}
 
-        # Add the current code context
-        context_parts.append(f"Current code context:\n{zed_request.input_excerpt}")
+### User Excerpt:
 
-        # Add input events (user actions)
-        if zed_request.input_events:
-            context_parts.append(f"User input events:\n{zed_request.input_events}")
+{}
+"""
+        #         prompt_template = """You are a code completion assistant. Given the User Excerpt, your job is to replace the <|user_cursor_is_here|> token; don't generate anything else other than your proposed replacement. Note that this replacement has to be strict; you MUST NOT generate any other part.
 
-        # Add speculated output if available
-        if zed_request.speculated_output:
-            context_parts.append(f"Speculated output:\n{zed_request.speculated_output}")
+        # ### User Excerpt:
 
-        # Add diagnostic information if available
-        if zed_request.diagnostic_groups:
-            diagnostics = []
-            for group_name, group_data in zed_request.diagnostic_groups:
-                diagnostics.append(f"{group_name}: {json.dumps(group_data)}")
-            context_parts.append("Diagnostics:\n" + "\n".join(diagnostics))
-
-        # Add git context if available and data collection is allowed
-        if zed_request.can_collect_data and zed_request.git_info:
-            git_info = []
-            if zed_request.git_info.head_sha:
-                git_info.append(f"HEAD SHA: {zed_request.git_info.head_sha}")
-            if zed_request.git_info.remote_origin_url:
-                git_info.append(f"Origin: {zed_request.git_info.remote_origin_url}")
-            if git_info:
-                context_parts.append("Git context:\n" + "\n".join(git_info))
-
-        # Combine all context
-        full_context = "\n\n".join(context_parts)
-
+        # {}
+        # """
         # Create the user message
-        user_message = f"""Based on the following context, predict the most likely code edit or completion:
-
-{full_context}
-
-Respond with only the predicted code changes or completion."""
-
-        messages = [
-            OpenAIMessage(role="system", content=config.system_prompt),
-            OpenAIMessage(role="user", content=user_message),
-        ]
+        prompt = prompt_template.format(zed_request.input_events, zed_request.input_excerpt)
+        messages = [OpenAIMessage(role="user", content=prompt)]
 
         return OpenAIRequest(
             model=config.model_name,
@@ -199,7 +168,9 @@ class ResponseTransformer:
     """Transforms OpenAI responses to Zed format"""
 
     @staticmethod
-    def openai_to_zed(openai_response: OpenAIResponse, request_id: Optional[str] = None) -> PredictEditsResponse:
+    def openai_to_zed(
+        request: PredictEditsBody, openai_response: OpenAIResponse, request_id: Optional[str] = None
+    ) -> PredictEditsResponse:
         """Transform OpenAI response to Zed's PredictEditsResponse format"""
 
         if not openai_response.choices:
@@ -207,13 +178,12 @@ class ResponseTransformer:
 
         # Get the first choice's message content
         output_excerpt = openai_response.choices[0].message.content
-
-        # Clean up the output - remove any markdown formatting if present
-        if output_excerpt.startswith("```") and output_excerpt.endswith("```"):
-            lines = output_excerpt.split("\n")
-            if len(lines) > 2:
-                # Remove first and last lines (markdown delimiters)
-                output_excerpt = "\n".join(lines[1:-1])
+        # og_excerpt = request.input_excerpt.split("<|editable_region_start|>")[1].split("<|editable_region_end|>")[0]
+        # output_excerpt = (
+        #     "<|editable_region_start|>"
+        #     + og_excerpt.replace("<|user_cursor_is_here|>", output_excerpt)
+        #     + "<|editable_region_end|>"
+        # )
 
         return PredictEditsResponse(request_id=request_id or str(uuid.uuid4()), output_excerpt=output_excerpt.strip())
 
@@ -235,13 +205,19 @@ async def shutdown():
 
 
 @app.post("/predict_edits/v2")
-async def predict_edits(request: PredictEditsBody) -> PredictEditsResponse:
+async def predict_edits(
+    request: PredictEditsBody,
+    authorization: str = Header(None),
+    x_zed_version: str = Header(None, alias="x-zed-version"),
+) -> PredictEditsResponse:
     """
     Main endpoint that mimics Zed's predict_edits/v2 API
     """
     request_id = str(uuid.uuid4())
 
     logger.info(f"Processing edit prediction request {request_id}")
+    logger.debug(f"Authorization header: {authorization[:20] + '...' if authorization else 'None'}")
+    logger.debug(f"Zed version: {x_zed_version}")
     logger.debug(f"Request: {request.model_dump()}")
 
     try:
@@ -261,7 +237,7 @@ async def predict_edits(request: PredictEditsBody) -> PredictEditsResponse:
         logger.debug(f"OpenAI response: {openai_response.model_dump()}")
 
         # Transform back to Zed format
-        zed_response = ResponseTransformer.openai_to_zed(openai_response, request_id)
+        zed_response = ResponseTransformer.openai_to_zed(request, openai_response, request_id)
 
         logger.info(f"Successfully processed request {request_id}")
         return zed_response
