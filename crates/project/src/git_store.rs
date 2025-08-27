@@ -4188,6 +4188,225 @@ impl Repository {
         )
     }
 
+    /// Returns a linearized commit log with parents and decorations.
+    pub fn commit_log(
+        &mut self,
+        include_all: bool,
+        max_count: Option<usize>,
+    ) -> oneshot::Receiver<Result<Vec<git::repository::CommitLogEntry>>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => {
+                    backend.commit_log(include_all, max_count).await
+                }
+                RepositoryState::Remote { .. } => {
+                    anyhow::bail!("git log not implemented for remote repositories")
+                }
+            }
+        })
+    }
+
+    /// Checkout a commit in detached HEAD state.
+    pub fn checkout_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            Some(format!("git switch --detach {sha}").into()),
+            move |repo, _| async move {
+                match repo {
+                    RepositoryState::Local { backend, .. } => backend.checkout_commit(sha).await,
+                    RepositoryState::Remote { .. } => {
+                        anyhow::bail!("checkout commit not implemented for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    /// Create a branch at a specific commit without switching.
+    pub fn create_branch_at(
+        &mut self,
+        branch_name: String,
+        sha: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        let display = format!("git branch {branch_name} {sha}");
+        self.send_job(Some(display.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => {
+                    backend.create_branch_at(branch_name, sha).await
+                }
+                RepositoryState::Remote { .. } => {
+                    anyhow::bail!("create branch at commit not implemented for remote repositories")
+                }
+            }
+        })
+    }
+
+    /// Returns the URL of a remote by name (e.g., "origin" or "upstream").
+    /// Only implemented for local repositories; remote repositories return Ok(None).
+    pub fn remote_url(
+        &mut self,
+        name: String,
+    ) -> oneshot::Receiver<Result<Option<String>>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => Ok(backend.remote_url(&name)),
+                RepositoryState::Remote { .. } => Ok(None),
+            }
+        })
+    }
+
+    pub fn rename_branch(
+        &mut self,
+        old_name: String,
+        new_name: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        let desc = format!("git branch -m {old_name} {new_name}");
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.rename_branch(old_name, new_name).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("rename branch not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn delete_branch(
+        &mut self,
+        name: String,
+        force: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        let desc = if force { format!("git branch -D {name}") } else { format!("git branch -d {name}") };
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.delete_branch(name, force).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("delete branch not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn create_tag(&mut self, name: String, sha: String) -> oneshot::Receiver<Result<()>> {
+        let desc = format!("git tag {name} {sha}");
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.create_tag(name, sha).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("create tag not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn delete_tag(&mut self, name: String) -> oneshot::Receiver<Result<()>> {
+        let desc = format!("git tag -d {name}");
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.delete_tag(name).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("delete tag not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn cherry_pick(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let desc = format!("git cherry-pick {sha}");
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.cherry_pick(sha).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("cherry-pick not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn revert(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let desc = format!("git revert {sha}");
+        self.send_job(Some(desc.into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.revert(sha).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("revert not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn diff_between(
+        &mut self,
+        base: String,
+        target: String,
+    ) -> oneshot::Receiver<Result<git::repository::CommitDiff>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.diff_between(base, target).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("diff between commits not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn head_sha(&mut self) -> oneshot::Receiver<Result<Option<String>>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => Ok(backend.head_sha().await),
+                RepositoryState::Remote { .. } => Ok(None),
+            }
+        })
+    }
+
+    pub fn list_stashes(&mut self) -> oneshot::Receiver<Result<Vec<git::repository::StashEntry>>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.list_stashes().await,
+                RepositoryState::Remote { .. } => anyhow::bail!("list stashes not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn stash_diff(&mut self, reference: String) -> oneshot::Receiver<Result<git::repository::CommitDiff>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.stash_diff(reference).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("stash diff not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn stash_apply(&mut self, reference: String) -> oneshot::Receiver<Result<()> > {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, environment, .. } => backend.stash_apply(reference, environment).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("stash apply not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn stash_drop(&mut self, reference: String) -> oneshot::Receiver<Result<()> > {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, environment, .. } => backend.stash_drop(reference, environment).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("stash drop not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn stash_pop_ref(&mut self, reference: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, environment, .. } => backend.stash_pop_ref(reference, environment).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("stash pop ref not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn create_tracking_branch(&mut self, remote: String, branch: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(Some(format!("git switch -c {} --track {}/{}", branch, remote, branch).into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.create_tracking_branch(remote, branch).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("create tracking branch not implemented for remote repositories"),
+            }
+        })
+    }
+
+    pub fn delete_remote_branch(&mut self, remote: String, branch: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(Some(format!("git push {} --delete {}", remote, branch).into()), move |repo, _| async move {
+            match repo {
+                RepositoryState::Local { backend, .. } => backend.delete_remote_branch(remote, branch).await,
+                RepositoryState::Remote { .. } => anyhow::bail!("delete remote branch not implemented for remote repositories"),
+            }
+        })
+    }
+
     pub fn check_for_pushed_commits(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
         let id = self.id;
         self.send_job(None, move |repo, _cx| async move {

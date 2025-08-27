@@ -27,9 +27,11 @@ pub mod branch_picker;
 mod commit_modal;
 pub mod commit_tooltip;
 mod commit_view;
+mod compare_view;
 mod conflict_view;
 pub mod file_diff_view;
 pub mod git_panel;
+mod git_graph;
 mod git_panel_settings;
 pub mod onboarding;
 pub mod picker_prompt;
@@ -60,6 +62,7 @@ pub fn init(cx: &mut App) {
         ProjectDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
+        git_graph::register(workspace);
         repository_selector::register(workspace);
         branch_picker::register(workspace);
 

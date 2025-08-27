@@ -174,6 +174,14 @@ pub struct CommitFile {
     pub new_text: Option<String>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StashEntry {
+    pub name: SharedString,    // e.g., "stash@{0}"
+    pub sha: SharedString,
+    pub timestamp: i64,
+    pub subject: SharedString,
+}
+
 impl CommitDetails {
     pub fn short_sha(&self) -> SharedString {
         self.sha[..SHORT_SHA_LENGTH].to_string().into()
@@ -463,6 +471,64 @@ pub trait GitRepository: Send + Sync {
     ) -> BoxFuture<'_, Result<String>>;
 
     fn default_branch(&self) -> BoxFuture<'_, Result<Option<SharedString>>>;
+
+    /// Returns a linearized commit log with parents and decorations suitable for
+    /// building a commit graph UI. If `include_all` is true, traverses all refs
+    /// (local and remote); otherwise traverses the current branch only.
+    fn commit_log(
+        &self,
+        include_all: bool,
+        max_count: Option<usize>,
+    ) -> BoxFuture<'_, Result<Vec<CommitLogEntry>>>;
+
+    /// Checks out a specific commit in detached HEAD state.
+    fn checkout_commit(&self, commit: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Creates a branch at the specified commit without switching to it.
+    fn create_branch_at(&self, branch_name: String, commit: String)
+        -> BoxFuture<'_, Result<()>>;
+
+    /// Renames a local branch.
+    fn rename_branch(&self, old_name: String, new_name: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Deletes a local branch. If `force` is true, uses `-D`.
+    fn delete_branch(&self, name: String, force: bool) -> BoxFuture<'_, Result<()>>;
+
+    /// Creates a lightweight tag pointing to the given commit.
+    fn create_tag(&self, name: String, commit: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Deletes a local tag.
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Cherry-picks a commit onto the current HEAD.
+    fn cherry_pick(&self, commit: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Reverts a commit on the current HEAD.
+    fn revert(&self, commit: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Computes a diff between two commits (base..target) returning per-file contents.
+    fn diff_between(&self, base: String, target: String) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Creates a new local branch tracking a remote branch and checks it out.
+    fn create_tracking_branch(&self, remote: String, branch: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Deletes a remote branch: `git push <remote> --delete <branch>`.
+    fn delete_remote_branch(&self, remote: String, branch: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Pops a specific stash reference.
+    fn stash_pop_ref(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    /// List all stashes.
+    fn list_stashes(&self) -> BoxFuture<'_, Result<Vec<StashEntry>>>;
+
+    /// Show a stash diff by reference (e.g., `stash@{0}`).
+    fn stash_diff(&self, reference: String) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Apply a stash to the working tree.
+    fn stash_apply(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    /// Drop a specific stash.
+    fn stash_drop(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
 }
 
 pub enum DiffType {
@@ -1636,8 +1702,604 @@ impl GitRepository for RealGitRepository {
                     .strip_prefix("refs/remotes/origin/")
                     .map(|s| SharedString::from(s.to_owned())))
             })
+        .boxed()
+    }
+
+    fn commit_log(
+        &self,
+        include_all: bool,
+        max_count: Option<usize>,
+    ) -> BoxFuture<'_, Result<Vec<CommitLogEntry>>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        self.executor
+            .spawn(async move {
+                let wd = working_directory?;
+
+                // Use unit separator (0x1F) between fields and record separator (0x1E) between commits
+                // Fields: sha, parents, author_name, author_email, timestamp, subject, decorations
+                let mut args: Vec<String> = vec![
+                    "--no-optional-locks".into(),
+                    "log".into(),
+                    "--date-order".into(),
+                    "--decorate=full".into(),
+                    "--pretty=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e".into(),
+                ];
+                if include_all {
+                    args.push("--all".into());
+                }
+                if let Some(n) = max_count {
+                    args.push(format!("-n{}", n));
+                }
+
+                let output = new_std_command(&git_binary_path)
+                    .current_dir(&wd)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .context("starting git log process")?;
+
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to run git log:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut entries = Vec::new();
+                for rec in stdout.split('\u{1e}') {
+                    if rec.trim().is_empty() {
+                        continue;
+                    }
+                    let mut fields = rec.split('\u{1f}');
+                    let sha = fields.next().unwrap_or("");
+                    if sha.is_empty() {
+                        continue;
+                    }
+                    let parents = fields
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| SharedString::from(s.to_string()))
+                        .collect::<Vec<_>>();
+                    let author_name = fields.next().unwrap_or("");
+                    let author_email = fields.next().unwrap_or("");
+                    let timestamp: i64 = fields
+                        .next()
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    let subject = fields.next().unwrap_or("");
+                    let decorations_field = fields.next().unwrap_or("");
+                    // decorations format: HEAD -> main, origin/main, tag: v1.2.3
+                    let decorations = decorations_field
+                        .split(',')
+                        .map(|s| SharedString::from(s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>();
+
+                    entries.push(CommitLogEntry {
+                        sha: SharedString::from(sha.to_string()),
+                        parents,
+                        author_name: SharedString::from(author_name.to_string()),
+                        author_email: SharedString::from(author_email.to_string()),
+                        subject: SharedString::from(subject.to_string()),
+                        timestamp,
+                        decorations,
+                    });
+                }
+
+                Ok(entries)
+            })
             .boxed()
     }
+
+    fn checkout_commit(&self, commit: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["switch", "--detach"]) // prefer switch for safety and consistency
+                .arg(&commit)
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to checkout commit:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn create_branch_at(&self, branch_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["branch", &branch_name, &commit])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to create branch at {commit}:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn rename_branch(&self, old_name: String, new_name: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["branch", "-m", &old_name, &new_name])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to rename branch:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn delete_branch(&self, name: String, force: bool) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let flag = if force { "-D" } else { "-d" };
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["branch", flag, &name])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to delete branch:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn create_tag(&self, name: String, commit: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["tag", &name, &commit])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to create tag:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["tag", "-d", &name])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to delete tag:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn cherry_pick(&self, commit: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["cherry-pick", &commit])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to cherry-pick commit:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn revert(&self, commit: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["revert", &commit])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to revert commit:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn diff_between(&self, base: String, target: String) -> BoxFuture<'_, Result<CommitDiff>> {
+        let working_directory = self.working_directory();
+        self.executor
+            .spawn(async move {
+                let working_directory = working_directory?;
+
+                // get name-status between commits
+                let diff_output = util::command::new_std_command("git")
+                    .current_dir(&working_directory)
+                    .args([
+                        "--no-optional-locks",
+                        "diff",
+                        "--name-status",
+                        "-z",
+                    ])
+                    .arg(&base)
+                    .arg(&target)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .context("starting git diff process")?;
+
+                anyhow::ensure!(
+                    diff_output.status.success(),
+                    "git diff failed: {}",
+                    String::from_utf8_lossy(&diff_output.stderr)
+                );
+
+                let changes = crate::commit::parse_git_diff_name_status(&String::from_utf8_lossy(&diff_output.stdout));
+
+                let mut cat_file_process = util::command::new_std_command("git")
+                    .current_dir(&working_directory)
+                    .args(["--no-optional-locks", "cat-file", "--batch=%(objectsize)"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("starting git cat-file process")?;
+
+                use std::io::Write as _;
+                let mut files = Vec::<CommitFile>::new();
+                let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
+                let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
+                let mut info_line = String::new();
+                let mut newline = [b'\0'];
+                for (path, status_code) in changes {
+                    match status_code {
+                        StatusCode::Modified => {
+                            writeln!(&mut stdin, "{target}:{}", path.display())?;
+                            writeln!(&mut stdin, "{base}:{}", path.display())?;
+                        }
+                        StatusCode::Added => {
+                            writeln!(&mut stdin, "{target}:{}", path.display())?;
+                        }
+                        StatusCode::Deleted => {
+                            writeln!(&mut stdin, "{base}:{}", path.display())?;
+                        }
+                        _ => continue,
+                    }
+                    stdin.flush()?;
+
+                    info_line.clear();
+                    stdout.read_line(&mut info_line)?;
+                    let len = info_line.trim_end().parse().with_context(|| {
+                        format!("invalid object size output from cat-file {}", info_line)
+                    })?;
+                    let mut text = vec![0; len];
+                    stdout.read_exact(&mut text)?;
+                    stdout.read_exact(&mut newline)?;
+                    let text = String::from_utf8_lossy(&text).to_string();
+
+                    let mut old_text = None;
+                    let mut new_text = None;
+                    match status_code {
+                        StatusCode::Modified => {
+                            info_line.clear();
+                            stdout.read_line(&mut info_line)?;
+                            let len = info_line.trim_end().parse().with_context(|| {
+                                format!("invalid object size output from cat-file {}", info_line)
+                            })?;
+                            let mut base_text = vec![0; len];
+                            stdout.read_exact(&mut base_text)?;
+                            stdout.read_exact(&mut newline)?;
+                            old_text = Some(String::from_utf8_lossy(&base_text).to_string());
+                            new_text = Some(text);
+                        }
+                        StatusCode::Added => new_text = Some(text),
+                        StatusCode::Deleted => old_text = Some(text),
+                        _ => continue,
+                    }
+
+                    files.push(CommitFile {
+                        path: path.into(),
+                        old_text,
+                        new_text,
+                    })
+                }
+
+                Ok(CommitDiff { files })
+            })
+            .boxed()
+    }
+
+    fn create_tracking_branch(&self, remote: String, branch: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let track_ref = format!("{}/{}", remote, branch);
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["switch", "-c", &branch, "--track", &track_ref])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to create tracking branch:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn delete_remote_branch(&self, remote: String, branch: String) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .args(["push", &remote, "--delete", &branch])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to delete remote branch:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn stash_pop_ref(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .envs(env.iter())
+                .args(["stash", "pop", &reference])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to pop stash:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn list_stashes(&self) -> BoxFuture<'_, Result<Vec<StashEntry>>> {
+        let working_directory = self.working_directory();
+        self.executor
+            .spawn(async move {
+                let wd = working_directory?;
+                let output = new_std_command("git")
+                    .current_dir(&wd)
+                    .args([
+                        "stash",
+                        "list",
+                        "--date=unix",
+                        "--pretty=%gd%x1f%H%x1f%at%x1f%s%x1e",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .context("starting git stash list process")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git stash list failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut entries = Vec::new();
+                for rec in stdout.split('\u{1e}') {
+                    if rec.trim().is_empty() { continue; }
+                    let mut fields = rec.split('\u{1f}');
+                    let name = fields.next().unwrap_or("");
+                    let sha = fields.next().unwrap_or("");
+                    let timestamp = fields.next().unwrap_or("0").parse::<i64>().unwrap_or(0);
+                    let subject = fields.next().unwrap_or("");
+                    entries.push(StashEntry {
+                        name: SharedString::from(name.to_string()),
+                        sha: SharedString::from(sha.to_string()),
+                        timestamp,
+                        subject: SharedString::from(subject.to_string()),
+                    });
+                }
+                Ok(entries)
+            })
+            .boxed()
+    }
+
+    fn stash_diff(&self, reference: String) -> BoxFuture<'_, Result<CommitDiff>> {
+        let working_directory = self.working_directory();
+        self.executor
+            .spawn(async move {
+                let working_directory = working_directory?;
+                let show_output = util::command::new_std_command("git")
+                    .current_dir(&working_directory)
+                    .args([
+                        "--no-optional-locks",
+                        "show",
+                        "--format=%P",
+                        "-z",
+                        "--no-renames",
+                        "--name-status",
+                    ])
+                    .arg(&reference)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .context("starting git show process for stash")?;
+                let show_stdout = String::from_utf8_lossy(&show_output.stdout);
+                let mut lines = show_stdout.split('\n');
+                let parent_sha = lines.next().unwrap().trim().trim_end_matches('\0');
+                let changes = parse_git_diff_name_status(lines.next().unwrap_or(""));
+                let mut cat_file_process = util::command::new_std_command("git")
+                    .current_dir(&working_directory)
+                    .args(["--no-optional-locks", "cat-file", "--batch=%(objectsize)"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("starting git cat-file process")?;
+                use std::io::Write as _;
+                let mut files = Vec::<CommitFile>::new();
+                let mut stdin = BufWriter::with_capacity(512, cat_file_process.stdin.take().unwrap());
+                let mut stdout = BufReader::new(cat_file_process.stdout.take().unwrap());
+                let mut info_line = String::new();
+                let mut newline = [b'\0'];
+                for (path, status_code) in changes {
+                    match status_code {
+                        StatusCode::Modified => {
+                            writeln!(&mut stdin, "{reference}:{}", path.display())?;
+                            writeln!(&mut stdin, "{parent_sha}:{}", path.display())?;
+                        }
+                        StatusCode::Added => {
+                            writeln!(&mut stdin, "{reference}:{}", path.display())?;
+                        }
+                        StatusCode::Deleted => {
+                            writeln!(&mut stdin, "{parent_sha}:{}", path.display())?;
+                        }
+                        _ => continue,
+                    }
+                    stdin.flush()?;
+                    info_line.clear();
+                    stdout.read_line(&mut info_line)?;
+                    let len = info_line.trim_end().parse().with_context(|| {
+                        format!("invalid object size output from cat-file {}", info_line)
+                    })?;
+                    let mut text = vec![0; len];
+                    stdout.read_exact(&mut text)?;
+                    stdout.read_exact(&mut newline)?;
+                    let text = String::from_utf8_lossy(&text).to_string();
+                    let mut old_text = None;
+                    let mut new_text = None;
+                    match status_code {
+                        StatusCode::Modified => {
+                            info_line.clear();
+                            stdout.read_line(&mut info_line)?;
+                            let len = info_line.trim_end().parse().with_context(|| {
+                                format!("invalid object size output from cat-file {}", info_line)
+                            })?;
+                            let mut parent_text = vec![0; len];
+                            stdout.read_exact(&mut parent_text)?;
+                            stdout.read_exact(&mut newline)?;
+                            old_text = Some(String::from_utf8_lossy(&parent_text).to_string());
+                            new_text = Some(text);
+                        }
+                        StatusCode::Added => new_text = Some(text),
+                        StatusCode::Deleted => old_text = Some(text),
+                        _ => continue,
+                    }
+                    files.push(CommitFile { path: path.into(), old_text, new_text });
+                }
+                Ok(CommitDiff { files })
+            })
+            .boxed()
+    }
+
+    fn stash_apply(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .envs(env.iter())
+                .args(["stash", "apply", &reference])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to apply stash:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn stash_drop(&self, reference: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let working_directory = self.working_directory();
+        let git_binary_path = self.git_binary_path.clone();
+        async move {
+            let output = new_smol_command(&git_binary_path)
+                .current_dir(&working_directory?)
+                .envs(env.iter())
+                .args(["stash", "drop", &reference])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to drop stash:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CommitLogEntry {
+    pub sha: SharedString,
+    pub parents: Vec<SharedString>,
+    pub author_name: SharedString,
+    pub author_email: SharedString,
+    /// Unix timestamp
+    pub timestamp: i64,
+    pub subject: SharedString,
+    /// Decorations from `%D` (refs, HEAD, tags)
+    pub decorations: Vec<SharedString>,
 }
 
 fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
