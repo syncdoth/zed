@@ -3,6 +3,7 @@ use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
+    git_graph_branch_filter::GitGraphBranchFilter,
     git_panel_settings::GitPanelSettings,
     git_status_icon,
 };
@@ -1477,6 +1478,102 @@ impl GitGraph {
             .anchor(Anchor::TopRight)
     }
 
+    /// Replaces the manual branch selection on the `All`-view filter and
+    /// reloads the graph. `None` means "show all".
+    pub(crate) fn apply_branch_selection(
+        &mut self,
+        selected_refs: Option<Arc<[SharedString]>>,
+        cx: &mut Context<Self>,
+    ) {
+        let LogSource::All(filter) = &self.log_source else {
+            return;
+        };
+        let next = GraphRefFilter {
+            selected_refs,
+            ..filter.clone()
+        };
+        self.set_log_source(LogSource::All(next), cx);
+    }
+
+    /// The currently selected manual branch refs, if any.
+    fn selected_refs(&self) -> Option<&Arc<[SharedString]>> {
+        match &self.log_source {
+            LogSource::All(filter) => {
+                filter.selected_refs.as_ref().filter(|refs| !refs.is_empty())
+            }
+            _ => None,
+        }
+    }
+
+    /// Label for the "Branches" dropdown trigger, reflecting the current
+    /// selection.
+    fn branch_dropdown_label(&self) -> SharedString {
+        match self.selected_refs() {
+            None => "All branches".into(),
+            Some(refs) if refs.len() == 1 => refs[0].clone(),
+            Some(refs) => format!("{} branches", refs.len()).into(),
+        }
+    }
+
+    /// Builds the branch multi-select popover from the repository's cached
+    /// branch list, honoring the show-local / show-remote toggles for which
+    /// branches are offered.
+    fn build_branch_filter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<GitGraphBranchFilter> {
+        let settings = GitPanelSettings::get_global(cx).git_graph;
+        let selected: std::collections::HashSet<SharedString> = self
+            .selected_refs()
+            .map(|refs| refs.iter().cloned().collect())
+            .unwrap_or_default();
+        let branches = self
+            .get_repository(cx)
+            .map(|repo| {
+                repo.read(cx)
+                    .branch_list
+                    .iter()
+                    .filter(|branch| {
+                        if branch.is_remote() {
+                            settings.show_remote_branches
+                        } else {
+                            settings.show_local_branches
+                        }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let weak_self = cx.weak_entity();
+        cx.new(|cx| GitGraphBranchFilter::new(weak_self, branches, selected, window, cx))
+    }
+
+    /// The "Branches" dropdown in the toolbar. Disabled outside the `All` view.
+    fn render_branch_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_all = matches!(self.log_source, LogSource::All(_));
+        let label = self.branch_dropdown_label();
+        let this = cx.entity();
+        PopoverMenu::new("git-graph-branch-dropdown")
+            .trigger(
+                Button::new("git-graph-branch-dropdown-trigger", label)
+                    .start_icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(!is_all),
+            )
+            .menu(move |window, cx| {
+                if !is_all {
+                    return None;
+                }
+                Some(this.update(cx, |this, cx| this.build_branch_filter(window, cx)))
+            })
+            .anchor(Anchor::TopRight)
+    }
+
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -2847,6 +2944,7 @@ impl GitGraph {
                             ),
                     ),
             )
+            .child(self.render_branch_dropdown(cx))
             .child(self.render_view_menu(cx))
     }
 
