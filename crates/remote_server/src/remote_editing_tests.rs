@@ -2769,7 +2769,12 @@ async fn test_remote_search_commits_streams_proto_chunks(
             repository_id: repository_id.to_proto(),
             log_source: Some(proto::GitLogSource {
                 source: Some(proto::git_log_source::Source::All(
-                    proto::GitLogSourceAll {},
+                    proto::GitLogSourceAll {
+                        local_branches: true,
+                        remote_branches: true,
+                        tags: true,
+                        selected_refs: Vec::new(),
+                    },
                 )),
             }),
             query: "needle".to_string(),
