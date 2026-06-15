@@ -12,8 +12,8 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
-        SearchCommitArgs,
+        CommitDiff, CommitFile, GraphRefFilter, InitialGraphCommitData, LogOrder, LogSource,
+        RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -1102,7 +1102,7 @@ pub fn init(cx: &mut App) {
                                         workspace,
                                         selected_repo_id,
                                         git_store,
-                                        LogSource::All,
+                                        LogSource::All(GraphRefFilter::default()),
                                         None,
                                         window,
                                         cx,
@@ -1126,7 +1126,7 @@ pub fn init(cx: &mut App) {
                                     workspace,
                                     selected_repo_id,
                                     git_store,
-                                    LogSource::All,
+                                    LogSource::All(GraphRefFilter::default()),
                                     Some(sha),
                                     window,
                                     cx,
@@ -1154,7 +1154,7 @@ pub fn resolve_file_history_target_from_project_path(
         .read(cx)
         .repository_and_path_for_project_path(project_path, cx)?;
     let log_source = if repo_path.is_empty() {
-        LogSource::All
+        LogSource::All(GraphRefFilter::default())
     } else {
         LogSource::Path(repo_path)
     };
@@ -1665,7 +1665,9 @@ impl GitGraph {
                     self.invalidate_state(cx);
                 }
             }
-            RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
+            RepositoryEvent::StashEntriesChanged
+                if matches!(self.log_source, LogSource::All(_)) =>
+            {
                 // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
                 if repository.read(cx).scan_id > 2 {
                     self.pending_select_sha = None;
@@ -4372,8 +4374,10 @@ mod persistence {
     };
     use git::{
         Oid,
-        repository::{LogOrder, LogSource, RepoPath},
+        repository::{GraphRefFilter, LogOrder, LogSource, RepoPath},
     };
+    use gpui::SharedString;
+    use std::sync::Arc;
     use workspace::WorkspaceDb;
 
     pub struct GitGraphsDb(ThreadSafeConnection);
@@ -4424,16 +4428,29 @@ mod persistence {
 
     pub fn serialize_log_source_type(log_source: &LogSource) -> i32 {
         match log_source {
-            LogSource::All => LOG_SOURCE_ALL,
+            LogSource::All(_) => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
     }
 
+    /// The per-repo persisted value for an `All` source is the user's manual
+    /// branch selection (newline-separated ref names). The ref-type toggles are
+    /// global and live in `settings.json`, so they are intentionally not stored
+    /// here.
     pub fn serialize_log_source_value(log_source: &LogSource) -> Option<String> {
         match log_source {
-            LogSource::All => None,
+            LogSource::All(filter) => filter
+                .selected_refs
+                .as_deref()
+                .filter(|refs| !refs.is_empty())
+                .map(|refs| {
+                    refs.iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
@@ -4451,7 +4468,21 @@ mod persistence {
 
     pub fn deserialize_log_source(state: &SerializedGitGraphState) -> LogSource {
         match state.log_source_type {
-            Some(LOG_SOURCE_ALL) => LogSource::All,
+            Some(LOG_SOURCE_ALL) => {
+                let selected_refs = state
+                    .log_source_value
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| {
+                        v.split('\n')
+                            .map(SharedString::from)
+                            .collect::<Arc<[_]>>()
+                    });
+                LogSource::All(GraphRefFilter {
+                    selected_refs,
+                    ..GraphRefFilter::default()
+                })
+            }
             Some(LOG_SOURCE_BRANCH) => state
                 .log_source_value
                 .as_ref()

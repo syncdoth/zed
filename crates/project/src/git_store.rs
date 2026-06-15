@@ -5920,7 +5920,7 @@ impl Repository {
             RepositoryEvent::StashEntriesChanged => {
                 if self.scan_id > 2 {
                     self.initial_graph_data
-                        .retain(|(log_source, _), _| *log_source != LogSource::All);
+                        .retain(|(log_source, _), _| !matches!(log_source, LogSource::All(_)));
                 }
             }
             _ => {}
@@ -10149,7 +10149,18 @@ fn deserialize_blame_buffer_response(
 fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
     proto::GitLogSource {
         source: Some(match log_source {
-            LogSource::All => proto::git_log_source::Source::All(proto::GitLogSourceAll {}),
+            LogSource::All(filter) => {
+                proto::git_log_source::Source::All(proto::GitLogSourceAll {
+                    local_branches: filter.local_branches,
+                    remote_branches: filter.remote_branches,
+                    tags: filter.tags,
+                    selected_refs: filter
+                        .selected_refs
+                        .as_deref()
+                        .map(|refs| refs.iter().map(|r| r.to_string()).collect())
+                        .unwrap_or_default(),
+                })
+            }
             LogSource::Branch(branch) => proto::git_log_source::Source::Branch(branch.to_string()),
             LogSource::Sha(sha) => proto::git_log_source::Source::Sha(sha.to_string()),
             LogSource::Path(path) => {
@@ -10164,7 +10175,24 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         .source
         .context("git log source is missing source")?
     {
-        proto::git_log_source::Source::All(_) => Ok(LogSource::All),
+        proto::git_log_source::Source::All(all) => {
+            let selected_refs = if all.selected_refs.is_empty() {
+                None
+            } else {
+                Some(
+                    all.selected_refs
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<std::sync::Arc<[_]>>(),
+                )
+            };
+            Ok(LogSource::All(git::repository::GraphRefFilter {
+                local_branches: all.local_branches,
+                remote_branches: all.remote_branches,
+                tags: all.tags,
+                selected_refs,
+            }))
+        }
         proto::git_log_source::Source::Branch(branch) => Ok(LogSource::Branch(branch.into())),
         proto::git_log_source::Source::Sha(sha) => Ok(LogSource::Sha(Oid::from_str(&sha)?)),
         proto::git_log_source::Source::Path(path) => {

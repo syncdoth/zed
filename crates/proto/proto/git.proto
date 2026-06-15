@@ -751,7 +751,12 @@ message GetCommitDataResponse {
   repeated CommitData commits = 1;
 }
 
-message GitLogSourceAll {}
+message GitLogSourceAll {
+  bool local_branches = 1;
+  bool remote_branches = 2;
+  bool tags = 3;
+  repeated string selected_refs = 4;
+}
 
 message GitLogSource {
   oneof source {
