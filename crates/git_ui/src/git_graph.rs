@@ -9,6 +9,7 @@ use crate::{
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
+use fs::Fs;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
@@ -49,7 +50,7 @@ use zed_actions::{
     buffer_search,
     search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
 };
-use settings::Settings as _;
+use settings::{Settings as _, update_settings_file};
 use task::{ResolvedTask, TaskContext, TaskVariables, VariableName};
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
@@ -57,6 +58,7 @@ use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
     HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
     RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
+    ContextMenuEntry, PopoverMenu,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
@@ -67,6 +69,13 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
     notifications::DetachAndPromptErr,
 };
+
+#[derive(Copy, Clone)]
+enum GraphSetting {
+    LocalBranches,
+    RemoteBranches,
+    Tags,
+}
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
@@ -1394,6 +1403,78 @@ impl GitGraph {
             anyhow::Ok(())
         })
         .detach_and_prompt_err("Failed to change branch", window, cx, |_, _, _| None);
+    }
+
+    /// Flips one of the global git graph ref-type settings in `settings.json`.
+    /// The settings observer reacts to the change and reloads the graph.
+    fn toggle_graph_setting(setting: GraphSetting, cx: &mut App) {
+        let current = GitPanelSettings::get_global(cx).git_graph;
+        update_settings_file(<dyn Fs>::global(cx), cx, move |settings, _| {
+            let git_graph = settings
+                .git_panel
+                .get_or_insert_default()
+                .git_graph
+                .get_or_insert_default();
+            match setting {
+                GraphSetting::LocalBranches => {
+                    git_graph.show_local_branches = Some(!current.show_local_branches);
+                }
+                GraphSetting::RemoteBranches => {
+                    git_graph.show_remote_branches = Some(!current.show_remote_branches);
+                }
+                GraphSetting::Tags => {
+                    git_graph.show_tags = Some(!current.show_tags);
+                }
+            }
+        });
+    }
+
+    /// The ⚙ "View" menu in the toolbar: toggles for which ref types the graph
+    /// shows. Disabled when not in the `All` view (e.g. file history).
+    fn render_view_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_all = matches!(self.log_source, LogSource::All(_));
+        PopoverMenu::new("git-graph-view-menu")
+            .trigger(
+                IconButton::new("git-graph-view-menu-trigger", IconName::Sliders)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .disabled(!is_all)
+                    .tooltip(Tooltip::text("View Options")),
+            )
+            .menu(move |window, cx| {
+                if !is_all {
+                    return None;
+                }
+                let settings = GitPanelSettings::get_global(cx).git_graph;
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.toggleable_entry(
+                        "Show Local Branches",
+                        settings.show_local_branches,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| {
+                            Self::toggle_graph_setting(GraphSetting::LocalBranches, cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Remote Branches",
+                        settings.show_remote_branches,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| {
+                            Self::toggle_graph_setting(GraphSetting::RemoteBranches, cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Tags",
+                        settings.show_tags,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| Self::toggle_graph_setting(GraphSetting::Tags, cx),
+                    )
+                }))
+            })
+            .anchor(Anchor::TopRight)
     }
 
     /// Computes the height of a single commit row in the git graph.
@@ -2766,6 +2847,7 @@ impl GitGraph {
                             ),
                     ),
             )
+            .child(self.render_view_menu(cx))
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
