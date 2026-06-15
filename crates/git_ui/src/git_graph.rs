@@ -2041,17 +2041,18 @@ impl GitGraph {
         div()
             .id(chip_id)
             .child(chip)
-            .when(is_branch, |this| {
-                this.on_click(cx.listener({
-                    let ref_name = ref_name.clone();
-                    move |this, event: &ClickEvent, window, cx| {
-                        if event.click_count() >= 2 {
-                            cx.stop_propagation();
-                            this.checkout_ref(ref_name.clone(), window, cx);
-                        }
+            .on_click(cx.listener({
+                let ref_name = ref_name.clone();
+                move |this, event: &ClickEvent, window, cx| {
+                    // Swallow clicks on the chip so they never reach the row
+                    // handler, which would open/close the changes panel and
+                    // shift the chip's position — breaking double-click checkout.
+                    cx.stop_propagation();
+                    if is_branch && event.click_count() >= 2 {
+                        this.checkout_ref(ref_name.clone(), window, cx);
                     }
-                }))
-            })
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
