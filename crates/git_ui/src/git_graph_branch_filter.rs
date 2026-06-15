@@ -129,7 +129,9 @@ impl Render for GitGraphBranchFilter {
         v_flex()
             .key_context("GitGraphBranchFilter")
             .track_focus(&self.focus_handle)
+            .elevation_2(cx)
             .w_72()
+            .overflow_hidden()
             .child(
                 div()
                     .p_1p5()

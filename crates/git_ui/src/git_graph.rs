@@ -7,7 +7,7 @@ use crate::{
     git_panel_settings::GitPanelSettings,
     git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use fs::Fs;
@@ -1953,6 +1953,36 @@ impl GitGraph {
         })
     }
 
+    /// Whether a `%D` ref decoration should be shown given the ref-type
+    /// visibility settings. `remote_names` holds the short names (e.g.
+    /// `origin/main`) of all remote-tracking branches, used to classify a
+    /// decoration as remote vs local. The detached `HEAD` marker is always
+    /// shown.
+    fn should_show_ref(
+        decoration: &str,
+        settings: &crate::git_panel_settings::GitGraphSettings,
+        remote_names: &HashSet<String>,
+        filter: bool,
+    ) -> bool {
+        if !filter {
+            return true;
+        }
+        if decoration.starts_with("tag: ") {
+            return settings.show_tags;
+        }
+        let branch = decoration
+            .strip_prefix("HEAD -> ")
+            .unwrap_or(decoration);
+        if branch == "HEAD" {
+            return true;
+        }
+        if remote_names.contains(branch) {
+            settings.show_remote_branches
+        } else {
+            settings.show_local_branches
+        }
+    }
+
     /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
     /// git's `%D` format, returning `None` for a detached `HEAD`.
     fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
@@ -2053,6 +2083,23 @@ impl GitGraph {
                 .as_ref()
                 .map(|branch| SharedString::from(branch.name().to_string()))
         });
+
+        // Ref-type visibility. Pruning the git log roots only drops commits that
+        // are *only* reachable through a hidden ref; a remote/tag label on a
+        // commit that's still reachable locally must be hidden here too.
+        let ref_settings = GitPanelSettings::get_global(cx).git_graph;
+        let filter_ref_chips = matches!(self.log_source, LogSource::All(_));
+        let remote_branch_names: HashSet<String> = repository
+            .as_ref()
+            .map(|repo| {
+                repo.read(cx)
+                    .branch_list
+                    .iter()
+                    .filter(|branch| branch.is_remote())
+                    .map(|branch| branch.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let row_height = Self::row_height(window, cx);
 
@@ -2167,19 +2214,33 @@ impl GitGraph {
                                 .gap_2()
                                 .overflow_hidden()
                                 .children((!commit.data.ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_ref_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                idx,
-                                                cx,
-                                            )
-                                        },
-                                    ))
+                                    h_flex().gap_1().children(
+                                        commit
+                                            .data
+                                            .ref_names
+                                            .iter()
+                                            .filter(|name| {
+                                                Self::should_show_ref(
+                                                    name,
+                                                    &ref_settings,
+                                                    &remote_branch_names,
+                                                    filter_ref_chips,
+                                                )
+                                            })
+                                            .map(|name| {
+                                                let is_head = Self::is_head_ref(
+                                                    name.as_ref(),
+                                                    &head_branch_name,
+                                                );
+                                                self.render_ref_chip(
+                                                    name,
+                                                    accent_color,
+                                                    is_head,
+                                                    idx,
+                                                    cx,
+                                                )
+                                            }),
+                                    )
                                 }))
                                 .child(subject_label),
                         )
@@ -7649,6 +7710,75 @@ mod tests {
             Some("feature-x"),
             "double-click checkout should switch the current branch"
         );
+    }
+
+    #[test]
+    fn test_should_show_ref() {
+        use crate::git_panel_settings::GitGraphSettings;
+
+        let remote_names: HashSet<String> =
+            ["origin/main", "origin/sam/audio_encoder"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let all = |local, remote, tags| GitGraphSettings {
+            show_local_branches: local,
+            show_remote_branches: remote,
+            show_tags: tags,
+        };
+
+        // When not filtering (non-All view), everything shows.
+        assert!(GitGraph::should_show_ref(
+            "tag: v1",
+            &all(false, false, false),
+            &remote_names,
+            false
+        ));
+
+        let hide_remote = all(true, false, true);
+        // A remote ref on a locally-reachable commit is hidden.
+        assert!(!GitGraph::should_show_ref(
+            "origin/sam/audio_encoder",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+        // A local branch whose name contains a slash is NOT mistaken for remote.
+        assert!(GitGraph::should_show_ref(
+            "feature/sam/audio_encoder",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+        // The checked-out local branch shows.
+        assert!(GitGraph::should_show_ref(
+            "HEAD -> main",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+
+        // Tags hidden when show_tags is off.
+        assert!(!GitGraph::should_show_ref(
+            "tag: v1",
+            &all(true, true, false),
+            &remote_names,
+            true
+        ));
+        // Local branches hidden when show_local_branches is off.
+        assert!(!GitGraph::should_show_ref(
+            "feature/x",
+            &all(false, true, true),
+            &remote_names,
+            true
+        ));
+        // Detached HEAD marker always shows.
+        assert!(GitGraph::should_show_ref(
+            "HEAD",
+            &all(false, false, false),
+            &remote_names,
+            true
+        ));
     }
 
     #[test]
