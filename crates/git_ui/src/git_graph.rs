@@ -1432,7 +1432,7 @@ impl GitGraph {
 
     /// The ⚙ "View" menu in the toolbar: toggles for which ref types the graph
     /// shows. Disabled when not in the `All` view (e.g. file history).
-    fn render_view_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_view_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let is_all = matches!(self.log_source, LogSource::All(_));
         PopoverMenu::new("git-graph-view-menu")
             .trigger(
@@ -6213,6 +6213,41 @@ mod tests {
             persistence::deserialize_log_order(&empty_state),
             LogOrder::DateOrder
         ));
+    }
+
+    #[test]
+    fn test_selected_refs_round_trip() {
+        use persistence::SerializedGitGraphState;
+
+        let selected_refs: Arc<[SharedString]> = vec![
+            SharedString::from("main"),
+            SharedString::from("origin/main"),
+        ]
+        .into();
+        let source = LogSource::All(GraphRefFilter {
+            selected_refs: Some(selected_refs.clone()),
+            ..GraphRefFilter::default()
+        });
+
+        let state = SerializedGitGraphState {
+            log_source_type: Some(persistence::serialize_log_source_type(&source)),
+            log_source_value: persistence::serialize_log_source_value(&source),
+            ..Default::default()
+        };
+
+        match persistence::deserialize_log_source(&state) {
+            LogSource::All(filter) => assert_eq!(
+                filter.selected_refs.as_deref(),
+                Some(&*selected_refs),
+                "selected branch refs should survive serialization"
+            ),
+            other => panic!("expected All, got {other:?}"),
+        }
+
+        // An `All` source with no selection persists nothing and restores to the
+        // default filter.
+        let no_selection = LogSource::All(GraphRefFilter::default());
+        assert_eq!(persistence::serialize_log_source_value(&no_selection), None);
     }
 
     #[gpui::test]
