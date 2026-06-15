@@ -3,6 +3,7 @@ use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
+    git_panel_settings::GitPanelSettings,
     git_status_icon,
 };
 use collections::{BTreeMap, HashMap, IndexSet};
@@ -48,7 +49,8 @@ use zed_actions::{
     buffer_search,
     search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
 };
-
+use settings::Settings as _;
+use task::{ResolvedTask, TaskContext, TaskVariables, VariableName};
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
@@ -1345,6 +1347,37 @@ impl GitGraph {
         cx.notify();
     }
 
+    /// Builds the `All`-view ref filter from the global git graph settings,
+    /// carrying over the user's manual branch selection (which is per-repo and
+    /// persisted separately from the global ref-type toggles).
+    fn filter_from_settings(
+        selected_refs: Option<Arc<[SharedString]>>,
+        cx: &App,
+    ) -> GraphRefFilter {
+        let settings = GitPanelSettings::get_global(cx).git_graph;
+        GraphRefFilter {
+            local_branches: settings.show_local_branches,
+            remote_branches: settings.show_remote_branches,
+            tags: settings.show_tags,
+            selected_refs,
+        }
+    }
+
+    /// Swaps the log source (e.g. when the filter changes), reloads the graph
+    /// from the new source, and triggers re-serialization so the change
+    /// persists.
+    fn set_log_source(&mut self, log_source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == log_source {
+            return;
+        }
+        self.log_source = log_source;
+        self.selected_entry_idx = None;
+        self.hovered_entry_idx = None;
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -1455,7 +1488,14 @@ impl GitGraph {
 
         let accent_colors = cx.theme().accents();
         let graph = GraphData::new(accent_colors_count(accent_colors));
-        let log_source = log_source.unwrap_or_default();
+        // Reconcile a persisted/default `All` source with the current global
+        // settings, preserving any per-repo branch selection.
+        let log_source = match log_source.unwrap_or_default() {
+            LogSource::All(filter) => {
+                LogSource::All(Self::filter_from_settings(filter.selected_refs, cx))
+            }
+            other => other,
+        };
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
@@ -1542,6 +1582,20 @@ impl GitGraph {
                 });
                 row_height = new_row_height;
                 cx.notify();
+            }
+        })
+        .detach();
+
+        // Keep the `All`-view ref filter in sync with the global git graph
+        // settings (the ⌥ View menu toggles write these), reloading when they
+        // change.
+        cx.observe_global_in::<settings::SettingsStore>(window, |this, _window, cx| {
+            let LogSource::All(filter) = &this.log_source else {
+                return;
+            };
+            let next = Self::filter_from_settings(filter.selected_refs.clone(), cx);
+            if &next != filter {
+                this.set_log_source(LogSource::All(next), cx);
             }
         })
         .detach();
