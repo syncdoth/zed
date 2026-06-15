@@ -16,6 +16,13 @@ pub struct ScrollbarSettings {
     pub show: Option<ShowScrollbar>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GitGraphSettings {
+    pub show_local_branches: bool,
+    pub show_remote_branches: bool,
+    pub show_tags: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, RegisterSetting)]
 pub struct GitPanelSettings {
     pub button: bool,
@@ -35,6 +42,7 @@ pub struct GitPanelSettings {
     pub starts_open: bool,
     pub commit_title_max_length: usize,
     pub entry_primary_click_action: GitPanelClickBehavior,
+    pub git_graph: GitGraphSettings,
 }
 
 #[derive(Default)]
@@ -84,6 +92,14 @@ impl Settings for GitPanelSettings {
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
             entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
+            git_graph: {
+                let git_graph = git_panel.git_graph.unwrap_or_default();
+                GitGraphSettings {
+                    show_local_branches: git_graph.show_local_branches.unwrap_or(true),
+                    show_remote_branches: git_graph.show_remote_branches.unwrap_or(true),
+                    show_tags: git_graph.show_tags.unwrap_or(true),
+                }
+            },
         }
     }
 }
