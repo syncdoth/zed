@@ -751,6 +751,7 @@ pub struct GraphRefFilter {
     local_branches: bool,
     remote_branches: bool,
     tags: bool,
+    selected_refs: Option<Arc<[SharedString]>>,
     additional_root: Option<Oid>,
 }
 
@@ -760,6 +761,7 @@ impl GraphRefFilter {
             local_branches: options.local_branches,
             remote_branches: options.remote_branches,
             tags: options.tags,
+            selected_refs: None,
             additional_root: None,
         }
     }
@@ -774,6 +776,24 @@ impl GraphRefFilter {
 
     pub fn tags(&self) -> bool {
         self.tags
+    }
+
+    pub fn with_selected_refs(
+        &self,
+        selected_refs: impl IntoIterator<Item = SharedString>,
+    ) -> Self {
+        let mut selected_refs = selected_refs.into_iter().collect::<Vec<_>>();
+        selected_refs.sort_unstable();
+        selected_refs.dedup();
+
+        Self {
+            selected_refs: (!selected_refs.is_empty()).then(|| selected_refs.into()),
+            ..self.clone()
+        }
+    }
+
+    pub fn selected_refs(&self) -> Option<&[SharedString]> {
+        self.selected_refs.as_deref()
     }
 
     pub fn with_additional_root(&self, root: Oid) -> Self {
@@ -813,26 +833,38 @@ impl LogSource {
         match self {
             LogSource::All(filter) => {
                 let mut args = vec![Cow::Borrowed("--ignore-missing")];
-                if filter.local_branches() {
-                    args.push(Cow::Borrowed("--branches"));
-                }
-                if filter.remote_branches() {
-                    args.push(Cow::Borrowed("--remotes"));
-                }
-                if filter.tags() {
-                    args.push(Cow::Borrowed("--tags"));
-                }
-                if !filter.local_branches()
-                    && !filter.remote_branches()
-                    && !filter.tags()
-                    && filter.additional_root().is_none()
-                {
-                    args.extend([Cow::Borrowed("--not"), Cow::Borrowed("--all")]);
-                } else if filter.local_branches() {
-                    args.push(Cow::Borrowed("HEAD"));
-                }
-                if let Some(root) = filter.additional_root() {
-                    args.push(Cow::Owned(root.to_string()));
+                if let Some(refs) = filter.selected_refs() {
+                    args.push(Cow::Borrowed("--end-of-options"));
+                    args.extend(
+                        refs.iter()
+                            .map(|reference| Cow::Borrowed(reference.as_str())),
+                    );
+                    if let Some(root) = filter.additional_root() {
+                        args.push(Cow::Owned(root.to_string()));
+                    }
+                    args.push(Cow::Borrowed("--"));
+                } else {
+                    if filter.local_branches() {
+                        args.push(Cow::Borrowed("--branches"));
+                    }
+                    if filter.remote_branches() {
+                        args.push(Cow::Borrowed("--remotes"));
+                    }
+                    if filter.tags() {
+                        args.push(Cow::Borrowed("--tags"));
+                    }
+                    if !filter.local_branches()
+                        && !filter.remote_branches()
+                        && !filter.tags()
+                        && filter.additional_root().is_none()
+                    {
+                        args.extend([Cow::Borrowed("--not"), Cow::Borrowed("--all")]);
+                    } else if filter.local_branches() {
+                        args.push(Cow::Borrowed("HEAD"));
+                    }
+                    if let Some(root) = filter.additional_root() {
+                        args.push(Cow::Owned(root.to_string()));
+                    }
                 }
                 args
             }
