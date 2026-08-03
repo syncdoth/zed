@@ -61,6 +61,7 @@ use util::{ResultExt, debug_panic};
 use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::DetachAndPromptErr,
 };
 use zed_actions::{
     buffer_search,
@@ -1354,6 +1355,24 @@ impl GitGraph {
         cx.notify();
     }
 
+    fn checkout_ref(
+        &mut self,
+        ref_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.get_repository(cx) else {
+            return;
+        };
+        let name = ref_name.to_string();
+        cx.spawn_in(window, async move |_, cx| {
+            repo.update(cx, |repo, _| repo.change_branch(name))
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to change branch", window, cx, |_, _, _| None);
+    }
+
     /// Builds the `All`-view ref filter from the global git graph settings,
     /// carrying over the user's manual branch selection (which is per-repo and
     /// persisted separately from the global ref-type toggles).
@@ -2088,8 +2107,20 @@ impl GitGraph {
         let Some(ref_name) = Self::ref_name_from_decoration(name) else {
             return chip.into_any_element();
         };
+        let is_branch = !name.starts_with("tag: ");
+        let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
         div()
+            .id(chip_id)
             .child(chip)
+            .on_click(cx.listener({
+                let ref_name = ref_name.clone();
+                move |this, event: &ClickEvent, window, cx| {
+                    if is_branch && event.click_count() >= 2 {
+                        cx.stop_propagation();
+                        this.checkout_ref(ref_name.clone(), window, cx);
+                    }
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -7668,6 +7699,81 @@ mod tests {
         assert_eq!(
             resolved_task.resolved.args,
             vec!["checkout".to_string(), "feature-x".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_double_click_branch_chip_checks_out(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature-x"]);
+
+        let commit_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("commit SHA should be valid");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: commit_sha,
+                parents: SmallVec::new(),
+                ref_names: vec!["HEAD -> main".into(), "feature-x".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let workspace_weak = workspace.downgrade();
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let head = repository.read_with(cx, |repo, _| {
+            repo.branch.as_ref().map(|branch| branch.name().to_string())
+        });
+        assert_eq!(head.as_deref(), Some("main"));
+
+        git_graph.update_in(cx, |git_graph, window, cx| {
+            git_graph.checkout_ref("feature-x".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let head = repository.read_with(cx, |repo, _| {
+            repo.branch.as_ref().map(|branch| branch.name().to_string())
+        });
+        assert_eq!(
+            head.as_deref(),
+            Some("feature-x"),
+            "double-click checkout should switch the current branch"
         );
     }
 
