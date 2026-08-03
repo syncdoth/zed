@@ -480,6 +480,8 @@ pub struct GitSettings {
     ///
     /// Default: on
     pub branch_picker: BranchPickerSettings,
+    /// Which refs to show in the git graph.
+    pub graph: GitGraphSettings,
     /// How hunks are displayed visually in the editor.
     ///
     /// Default: staged_hollow
@@ -608,6 +610,13 @@ pub struct BranchPickerSettings {
     pub show_author_name: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitGraphSettings {
+    pub show_local_branches: bool,
+    pub show_remote_branches: bool,
+    pub show_tags: bool,
+}
+
 impl Default for BranchPickerSettings {
     fn default() -> Self {
         Self {
@@ -709,6 +718,14 @@ impl Settings for ProjectSettings {
                 let branch_picker = git.branch_picker.unwrap();
                 BranchPickerSettings {
                     show_author_name: branch_picker.show_author_name.unwrap(),
+                }
+            },
+            graph: {
+                let graph = git.graph.unwrap();
+                GitGraphSettings {
+                    show_local_branches: graph.show_local_branches.unwrap(),
+                    show_remote_branches: graph.show_remote_branches.unwrap(),
+                    show_tags: graph.show_tags.unwrap(),
                 }
             },
             hunk_style: git.hunk_style.unwrap(),

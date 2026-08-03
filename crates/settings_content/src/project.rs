@@ -574,6 +574,8 @@ pub struct GitSettings {
     ///
     /// Default: on
     pub branch_picker: Option<BranchPickerSettingsContent>,
+    /// Which refs to show in the git graph.
+    pub graph: Option<GitGraphSettingsContent>,
     /// File diff settings.
     pub file_diff: Option<FileDiffSettingsContent>,
     /// How hunks are displayed visually in the editor.
@@ -729,6 +731,26 @@ pub struct BranchPickerSettingsContent {
     ///
     /// Default: false
     pub show_author_name: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct GitGraphSettingsContent {
+    /// Whether to show local branches in the git graph.
+    ///
+    /// Default: true
+    pub show_local_branches: Option<bool>,
+    /// Whether to show remote branches in the git graph.
+    ///
+    /// Default: true
+    pub show_remote_branches: Option<bool>,
+    /// Whether to show tags in the git graph.
+    ///
+    /// Default: true
+    pub show_tags: Option<bool>,
 }
 
 #[with_fallible_options]

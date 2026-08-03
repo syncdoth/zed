@@ -727,25 +727,115 @@ impl LogOrder {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// Selects which ref types a [`GraphRefFilter`] includes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphRefFilterOptions {
+    pub local_branches: bool,
+    pub remote_branches: bool,
+    pub tags: bool,
+}
+
+impl Default for GraphRefFilterOptions {
+    fn default() -> Self {
+        Self {
+            local_branches: true,
+            remote_branches: true,
+            tags: true,
+        }
+    }
+}
+
+/// Controls which refs the "all" git graph view is built from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GraphRefFilter {
+    local_branches: bool,
+    remote_branches: bool,
+    tags: bool,
+    additional_root: Option<Oid>,
+}
+
+impl GraphRefFilter {
+    pub fn new(options: GraphRefFilterOptions) -> Self {
+        Self {
+            local_branches: options.local_branches,
+            remote_branches: options.remote_branches,
+            tags: options.tags,
+            additional_root: None,
+        }
+    }
+
+    pub fn local_branches(&self) -> bool {
+        self.local_branches
+    }
+
+    pub fn remote_branches(&self) -> bool {
+        self.remote_branches
+    }
+
+    pub fn tags(&self) -> bool {
+        self.tags
+    }
+
+    pub fn with_additional_root(&self, root: Oid) -> Self {
+        Self {
+            additional_root: Some(root),
+            ..self.clone()
+        }
+    }
+
+    pub fn additional_root(&self) -> Option<Oid> {
+        self.additional_root
+    }
+}
+
+impl Default for GraphRefFilter {
+    fn default() -> Self {
+        Self::new(GraphRefFilterOptions::default())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LogSource {
-    #[default]
-    All,
+    All(GraphRefFilter),
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
 }
 
+impl Default for LogSource {
+    fn default() -> Self {
+        LogSource::All(GraphRefFilter::default())
+    }
+}
+
 impl LogSource {
     fn get_args(&self) -> Vec<Cow<'_, str>> {
         match self {
-            LogSource::All => vec![
-                Cow::Borrowed("--ignore-missing"), // needed in case of unborn HEAD
-                Cow::Borrowed("--branches"),
-                Cow::Borrowed("--remotes"),
-                Cow::Borrowed("--tags"),
-                Cow::Borrowed("HEAD"),
-            ],
+            LogSource::All(filter) => {
+                let mut args = vec![Cow::Borrowed("--ignore-missing")];
+                if filter.local_branches() {
+                    args.push(Cow::Borrowed("--branches"));
+                }
+                if filter.remote_branches() {
+                    args.push(Cow::Borrowed("--remotes"));
+                }
+                if filter.tags() {
+                    args.push(Cow::Borrowed("--tags"));
+                }
+                if !filter.local_branches()
+                    && !filter.remote_branches()
+                    && !filter.tags()
+                    && filter.additional_root().is_none()
+                {
+                    args.extend([Cow::Borrowed("--not"), Cow::Borrowed("--all")]);
+                } else if filter.local_branches() {
+                    args.push(Cow::Borrowed("HEAD"));
+                }
+                if let Some(root) = filter.additional_root() {
+                    args.push(Cow::Owned(root.to_string()));
+                }
+                args
+            }
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
@@ -4293,6 +4383,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_filter_args() {
+        let filter = |local, remote, tags| {
+            GraphRefFilter::new(GraphRefFilterOptions {
+                local_branches: local,
+                remote_branches: remote,
+                tags,
+            })
+        };
+
+        assert_eq!(
+            LogSource::All(filter(true, true, true)).get_args(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
+        );
+        assert_eq!(
+            LogSource::All(filter(true, true, false)).get_args(),
+            vec!["--ignore-missing", "--branches", "--remotes", "HEAD"]
+        );
+        assert_eq!(
+            LogSource::All(filter(true, false, true)).get_args(),
+            vec!["--ignore-missing", "--branches", "--tags", "HEAD"]
+        );
+        assert_eq!(
+            LogSource::All(filter(false, true, true)).get_args(),
+            vec!["--ignore-missing", "--remotes", "--tags"]
+        );
+        assert_eq!(
+            LogSource::All(filter(false, false, false)).get_args(),
+            vec!["--ignore-missing", "--not", "--all"]
+        );
+        assert_eq!(
+            LogSource::default().get_args(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
+        );
+
+        let root = Oid::from_bytes(&[1; 20]).expect("valid object ID");
+        let root_string = root.to_string();
+        let with_additional_root = GraphRefFilter::default().with_additional_root(root);
+        assert_eq!(
+            LogSource::All(with_additional_root).get_args(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD",
+                root_string.as_str()
+            ]
+        );
+
+        let only_additional_root = GraphRefFilter::new(GraphRefFilterOptions {
+            local_branches: false,
+            remote_branches: false,
+            tags: false,
+        })
+        .with_additional_root(root);
+        assert_eq!(
+            LogSource::All(only_additional_root).get_args(),
+            vec!["--ignore-missing", root_string.as_str()]
+        );
+    }
+
     fn disable_git_global_config() {
         unsafe {
             std::env::set_var("GIT_CONFIG_GLOBAL", "");
@@ -6508,9 +6672,9 @@ mod tests {
         .unwrap();
         let git = repo.git_binary();
 
-        let graph_commits = async || {
+        let graph_commits = async |source| {
             let (tx, rx) = smol::channel::unbounded();
-            repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
+            repo.initial_graph_data(source, LogOrder::DateOrder, tx)
                 .await
                 .unwrap();
             let mut commits = std::collections::HashSet::new();
@@ -6538,18 +6702,61 @@ mod tests {
             .await
             .unwrap();
 
-        let graph = graph_commits().await;
+        let graph = graph_commits(LogSource::default()).await;
         assert!(graph.contains(&branch_sha));
         assert!(!graph.contains(&hidden_sha));
+
+        let no_refs = GraphRefFilter::new(GraphRefFilterOptions {
+            local_branches: false,
+            remote_branches: false,
+            tags: false,
+        });
+        assert!(
+            graph_commits(LogSource::All(no_refs.clone()))
+                .await
+                .is_empty()
+        );
+
+        let graph = graph_commits(LogSource::All(no_refs.with_additional_root(hidden_sha))).await;
+        assert!(graph.contains(&branch_sha));
+        assert!(graph.contains(&hidden_sha));
 
         git.build_command(&["update-ref", "--no-deref", "HEAD", &hidden_sha.to_string()])
             .output()
             .await
             .unwrap();
 
-        let graph = graph_commits().await;
+        let graph = graph_commits(LogSource::default()).await;
         assert!(graph.contains(&branch_sha));
         assert!(graph.contains(&hidden_sha));
+
+        let remote_only = LogSource::All(GraphRefFilter::new(GraphRefFilterOptions {
+            local_branches: false,
+            remote_branches: true,
+            tags: false,
+        }));
+        assert!(graph_commits(remote_only.clone()).await.is_empty());
+        repo.update_ref("refs/remotes/origin/main".into(), hidden_sha.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            graph_commits(remote_only).await,
+            std::collections::HashSet::from([branch_sha, hidden_sha])
+        );
+
+        let tags_only = LogSource::All(GraphRefFilter::new(GraphRefFilterOptions {
+            local_branches: false,
+            remote_branches: false,
+            tags: true,
+        }));
+        assert!(graph_commits(tags_only.clone()).await.is_empty());
+        repo.update_ref("refs/tags/v1".into(), hidden_sha.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            graph_commits(tags_only).await,
+            std::collections::HashSet::from([branch_sha, hidden_sha])
+        );
     }
 
     #[gpui::test]
