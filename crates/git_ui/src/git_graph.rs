@@ -3,17 +3,18 @@ use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
+    git_panel_settings::GitPanelSettings,
     git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
-        SearchCommitArgs,
+        CommitDiff, CommitFile, GraphRefFilter, GraphRefFilterOptions, InitialGraphCommitData,
+        LogOrder, LogSource, RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -30,12 +31,13 @@ use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{Picker, PickerDelegate};
 use project::{
-    ProjectPath,
+    Fs, ProjectPath,
     git_store::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
         RepositoryEvent, RepositoryId,
     },
 };
+use settings::{Settings as _, update_settings_file};
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
@@ -44,16 +46,11 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use zed_actions::{
-    buffer_search,
-    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
-};
-
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
+    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu,
     RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
@@ -64,6 +61,17 @@ use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
 };
+use zed_actions::{
+    buffer_search,
+    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
+};
+
+#[derive(Copy, Clone)]
+enum GraphSetting {
+    LocalBranches,
+    RemoteBranches,
+    Tags,
+}
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
@@ -1102,7 +1110,7 @@ pub fn init(cx: &mut App) {
                                         workspace,
                                         selected_repo_id,
                                         git_store,
-                                        LogSource::All,
+                                        LogSource::All(GraphRefFilter::default()),
                                         None,
                                         window,
                                         cx,
@@ -1126,7 +1134,7 @@ pub fn init(cx: &mut App) {
                                     workspace,
                                     selected_repo_id,
                                     git_store,
-                                    LogSource::All,
+                                    LogSource::All(GraphRefFilter::default()),
                                     Some(sha),
                                     window,
                                     cx,
@@ -1154,7 +1162,7 @@ pub fn resolve_file_history_target_from_project_path(
         .read(cx)
         .repository_and_path_for_project_path(project_path, cx)?;
     let log_source = if repo_path.is_empty() {
-        LogSource::All
+        LogSource::All(GraphRefFilter::default())
     } else {
         LogSource::Path(repo_path)
     };
@@ -1345,6 +1353,108 @@ impl GitGraph {
         cx.notify();
     }
 
+    /// Builds the `All`-view ref filter from the global git graph settings,
+    /// carrying over the user's manual branch selection (which is per-repo and
+    /// persisted separately from the global ref-type toggles).
+    fn filter_from_settings(selected_refs: Option<&[SharedString]>, cx: &App) -> GraphRefFilter {
+        let settings = GitPanelSettings::get_global(cx).git_graph;
+        GraphRefFilter::new(
+            GraphRefFilterOptions {
+                local_branches: settings.show_local_branches,
+                remote_branches: settings.show_remote_branches,
+                tags: settings.show_tags,
+            },
+            selected_refs.into_iter().flatten().cloned(),
+        )
+    }
+
+    /// Swaps the log source (e.g. when the filter changes), reloads the graph
+    /// from the new source. `invalidate_state` emits `ItemEvent::Edit`, which
+    /// in turn triggers re-serialization so the change persists.
+    fn set_log_source(&mut self, log_source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == log_source {
+            return;
+        }
+        self.log_source = log_source;
+        self.selected_entry_idx = None;
+        self.hovered_entry_idx = None;
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    /// Flips one of the global git graph ref-type settings in `settings.json`.
+    /// The settings observer reacts to the change and reloads the graph.
+    fn toggle_graph_setting(setting: GraphSetting, cx: &mut App) {
+        let current = GitPanelSettings::get_global(cx).git_graph;
+        update_settings_file(<dyn Fs>::global(cx), cx, move |settings, _| {
+            let git_graph = settings
+                .git_panel
+                .get_or_insert_default()
+                .git_graph
+                .get_or_insert_default();
+            match setting {
+                GraphSetting::LocalBranches => {
+                    git_graph.show_local_branches = Some(!current.show_local_branches);
+                }
+                GraphSetting::RemoteBranches => {
+                    git_graph.show_remote_branches = Some(!current.show_remote_branches);
+                }
+                GraphSetting::Tags => {
+                    git_graph.show_tags = Some(!current.show_tags);
+                }
+            }
+        });
+    }
+
+    /// The "View Options" menu in the toolbar toggles which ref types the graph
+    /// shows. It is disabled when not in the `All` view (e.g. file history).
+    fn render_view_menu(&self) -> impl IntoElement {
+        let is_all = matches!(self.log_source, LogSource::All(_));
+        PopoverMenu::new("git-graph-view-menu")
+            .trigger(
+                IconButton::new("git-graph-view-menu-trigger", IconName::Filter)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .disabled(!is_all)
+                    .tooltip(Tooltip::text("View Options")),
+            )
+            .menu(move |window, cx| {
+                if !is_all {
+                    return None;
+                }
+                let settings = GitPanelSettings::get_global(cx).git_graph;
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.toggleable_entry(
+                        "Show Local Branches",
+                        settings.show_local_branches,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| {
+                            Self::toggle_graph_setting(GraphSetting::LocalBranches, cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Remote Branches",
+                        settings.show_remote_branches,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| {
+                            Self::toggle_graph_setting(GraphSetting::RemoteBranches, cx)
+                        },
+                    )
+                    .toggleable_entry(
+                        "Show Tags",
+                        settings.show_tags,
+                        IconPosition::Start,
+                        None,
+                        move |_window, cx| Self::toggle_graph_setting(GraphSetting::Tags, cx),
+                    )
+                }))
+            })
+            .anchor(Anchor::TopRight)
+    }
+
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -1455,7 +1565,14 @@ impl GitGraph {
 
         let accent_colors = cx.theme().accents();
         let graph = GraphData::new(accent_colors_count(accent_colors));
-        let log_source = log_source.unwrap_or_default();
+        // Reconcile a persisted/default `All` source with the current global
+        // settings, preserving any per-repo branch selection.
+        let log_source = match log_source.unwrap_or_default() {
+            LogSource::All(filter) => {
+                LogSource::All(Self::filter_from_settings(filter.selected_refs(), cx))
+            }
+            other => other,
+        };
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
@@ -1542,6 +1659,24 @@ impl GitGraph {
                 });
                 row_height = new_row_height;
                 cx.notify();
+            }
+        })
+        .detach();
+
+        // Keep the `All`-view ref filter in sync with the global git graph
+        // settings. Manual ref selections already determine the log roots, so
+        // changing the ref-type toggles only needs to update chip rendering.
+        cx.observe_global_in::<settings::SettingsStore>(window, |this, _window, cx| {
+            let LogSource::All(filter) = &this.log_source else {
+                return;
+            };
+            let next = Self::filter_from_settings(filter.selected_refs(), cx);
+            if &next != filter {
+                if filter.selected_refs().is_some() {
+                    cx.notify();
+                } else {
+                    this.set_log_source(LogSource::All(next), cx);
+                }
             }
         })
         .detach();
@@ -1665,7 +1800,9 @@ impl GitGraph {
                     self.invalidate_state(cx);
                 }
             }
-            RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
+            RepositoryEvent::StashEntriesChanged
+                if matches!(self.log_source, LogSource::All(_)) =>
+            {
                 // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
                 if repository.read(cx).scan_id > 2 {
                     self.pending_select_sha = None;
@@ -1699,6 +1836,34 @@ impl GitGraph {
         head_branch_name.as_ref().is_some_and(|head| {
             ref_name == head.as_ref() || ref_name.strip_prefix("HEAD -> ") == Some(head.as_ref())
         })
+    }
+
+    /// Whether a `%D` ref decoration should be shown given the ref-type
+    /// visibility settings. `remote_names` holds the short names (e.g.
+    /// `origin/main`) of all remote-tracking branches, used to classify a
+    /// decoration as remote vs local. The detached `HEAD` marker is always
+    /// shown.
+    fn should_show_ref(
+        decoration: &str,
+        settings: &crate::git_panel_settings::GitGraphSettings,
+        remote_names: &HashSet<SharedString>,
+        filter: bool,
+    ) -> bool {
+        if !filter {
+            return true;
+        }
+        if decoration.starts_with("tag: ") {
+            return settings.show_tags;
+        }
+        let branch = decoration.strip_prefix("HEAD -> ").unwrap_or(decoration);
+        if branch == "HEAD" {
+            return true;
+        }
+        if remote_names.contains(branch) {
+            settings.show_remote_branches
+        } else {
+            settings.show_local_branches
+        }
     }
 
     /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
@@ -1785,6 +1950,23 @@ impl GitGraph {
                 .map(|branch| SharedString::from(branch.name().to_string()))
         });
 
+        // Ref-type visibility. Pruning the git log roots only drops commits that
+        // are *only* reachable through a hidden ref; a remote/tag label on a
+        // commit that's still reachable locally must be hidden here too.
+        let ref_settings = GitPanelSettings::get_global(cx).git_graph;
+        let filter_ref_chips = matches!(self.log_source, LogSource::All(_));
+        let remote_branch_names: HashSet<SharedString> = repository
+            .as_ref()
+            .map(|repo| {
+                repo.read(cx)
+                    .branch_list
+                    .iter()
+                    .filter(|branch| branch.is_remote())
+                    .map(|branch| SharedString::from(branch.name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let row_height = Self::row_height(window, cx);
 
         // We fetch data outside the visible viewport to avoid loading entries when
@@ -1844,6 +2026,20 @@ impl GitGraph {
 
                 let is_selected = self.selected_entry_idx == Some(idx);
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
+                let mut visible_ref_names = commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .filter(|name| {
+                        Self::should_show_ref(
+                            name,
+                            &ref_settings,
+                            &remote_branch_names,
+                            filter_ref_chips,
+                        )
+                    })
+                    .peekable();
+                let has_visible_ref_names = visible_ref_names.peek().is_some();
                 let column_label = |label: SharedString| {
                     Label::new(label)
                         .when(!is_selected, |c| c.color(Color::Muted))
@@ -1897,20 +2093,12 @@ impl GitGraph {
                             h_flex()
                                 .gap_2()
                                 .overflow_hidden()
-                                .children((!commit.data.ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_ref_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                idx,
-                                                cx,
-                                            )
-                                        },
-                                    ))
+                                .children(has_visible_ref_names.then(|| {
+                                    h_flex().gap_1().children(visible_ref_names.map(|name| {
+                                        let is_head =
+                                            Self::is_head_ref(name.as_ref(), &head_branch_name);
+                                        self.render_ref_chip(name, accent_color, is_head, idx, cx)
+                                    }))
                                 }))
                                 .child(subject_label),
                         )
@@ -2675,6 +2863,7 @@ impl GitGraph {
                             ),
                     ),
             )
+            .child(self.render_view_menu())
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -4372,8 +4561,9 @@ mod persistence {
     };
     use git::{
         Oid,
-        repository::{LogOrder, LogSource, RepoPath},
+        repository::{GraphRefFilter, GraphRefFilterOptions, LogOrder, LogSource, RepoPath},
     };
+    use gpui::SharedString;
     use workspace::WorkspaceDb;
 
     pub struct GitGraphsDb(ThreadSafeConnection);
@@ -4424,16 +4614,25 @@ mod persistence {
 
     pub fn serialize_log_source_type(log_source: &LogSource) -> i32 {
         match log_source {
-            LogSource::All => LOG_SOURCE_ALL,
+            LogSource::All(_) => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
     }
 
+    /// The per-repo persisted value for an `All` source is the user's manual
+    /// branch selection (newline-separated ref names). The ref-type toggles are
+    /// global and live in `settings.json`, so they are intentionally not stored
+    /// here.
     pub fn serialize_log_source_value(log_source: &LogSource) -> Option<String> {
         match log_source {
-            LogSource::All => None,
+            LogSource::All(filter) => filter.selected_refs().map(|refs| {
+                refs.iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
@@ -4451,7 +4650,16 @@ mod persistence {
 
     pub fn deserialize_log_source(state: &SerializedGitGraphState) -> LogSource {
         match state.log_source_type {
-            Some(LOG_SOURCE_ALL) => LogSource::All,
+            Some(LOG_SOURCE_ALL) => LogSource::All(GraphRefFilter::new(
+                GraphRefFilterOptions::default(),
+                state
+                    .log_source_value
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .into_iter()
+                    .flat_map(|value| value.split('\n'))
+                    .map(SharedString::from),
+            )),
             Some(LOG_SOURCE_BRANCH) => state
                 .log_source_value
                 .as_ref()
@@ -5877,7 +6085,7 @@ mod tests {
         };
         assert_eq!(
             persistence::deserialize_log_source(&all_state),
-            LogSource::All
+            LogSource::All(GraphRefFilter::default())
         );
         assert!(matches!(
             persistence::deserialize_log_order(&all_state),
@@ -5907,7 +6115,7 @@ mod tests {
         let empty_state = SerializedGitGraphState::default();
         assert_eq!(
             persistence::deserialize_log_source(&empty_state),
-            LogSource::All
+            LogSource::All(GraphRefFilter::default())
         );
         assert!(matches!(
             persistence::deserialize_log_order(&empty_state),
@@ -6068,7 +6276,7 @@ mod tests {
         restored_graph.read_with(&*cx, |graph, _| {
             assert_eq!(
                 graph.log_source,
-                LogSource::All,
+                LogSource::All(GraphRefFilter::default()),
                 "log_source should be restored"
             );
 
@@ -6775,7 +6983,7 @@ mod tests {
                 workspace,
                 repository.read(cx).id,
                 project.read(cx).git_store().clone(),
-                LogSource::All,
+                LogSource::All(GraphRefFilter::default()),
                 Some(first_sha.to_string()),
                 window,
                 cx,
@@ -7238,6 +7446,74 @@ mod tests {
             resolved_task.resolved.args,
             vec!["checkout".to_string(), "feature-x".to_string()]
         );
+    }
+
+    #[test]
+    fn test_should_show_ref() {
+        use crate::git_panel_settings::GitGraphSettings;
+
+        let remote_names: HashSet<SharedString> = ["origin/main", "origin/sam/audio_encoder"]
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        let all = |local, remote, tags| GitGraphSettings {
+            show_local_branches: local,
+            show_remote_branches: remote,
+            show_tags: tags,
+        };
+
+        // When not filtering (non-All view), everything shows.
+        assert!(GitGraph::should_show_ref(
+            "tag: v1",
+            &all(false, false, false),
+            &remote_names,
+            false
+        ));
+
+        let hide_remote = all(true, false, true);
+        // A remote ref on a locally-reachable commit is hidden.
+        assert!(!GitGraph::should_show_ref(
+            "origin/sam/audio_encoder",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+        // A local branch whose name contains a slash is NOT mistaken for remote.
+        assert!(GitGraph::should_show_ref(
+            "feature/sam/audio_encoder",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+        // The checked-out local branch shows.
+        assert!(GitGraph::should_show_ref(
+            "HEAD -> main",
+            &hide_remote,
+            &remote_names,
+            true
+        ));
+
+        // Tags hidden when show_tags is off.
+        assert!(!GitGraph::should_show_ref(
+            "tag: v1",
+            &all(true, true, false),
+            &remote_names,
+            true
+        ));
+        // Local branches hidden when show_local_branches is off.
+        assert!(!GitGraph::should_show_ref(
+            "feature/x",
+            &all(false, true, true),
+            &remote_names,
+            true
+        ));
+        // Detached HEAD marker always shows.
+        assert!(GitGraph::should_show_ref(
+            "HEAD",
+            &all(false, false, false),
+            &remote_names,
+            true
+        ));
     }
 
     #[test]

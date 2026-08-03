@@ -751,10 +751,34 @@ pub struct GitPanelSettingsContent {
     /// Default: 0
     pub commit_title_max_length: Option<usize>,
 
+    /// Which refs the git graph shows by default.
+    pub git_graph: Option<GitGraphSettingsContent>,
+
     /// Default action when clicking a changed file in the Git panel.
     ///
     /// Default: project_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
+}
+
+#[with_fallible_options]
+#[derive(
+    Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq,
+)]
+pub struct GitGraphSettingsContent {
+    /// Whether to show local branches in the git graph.
+    ///
+    /// Default: true
+    pub show_local_branches: Option<bool>,
+
+    /// Whether to show remote branches in the git graph.
+    ///
+    /// Default: true
+    pub show_remote_branches: Option<bool>,
+
+    /// Whether to show tags in the git graph.
+    ///
+    /// Default: true
+    pub show_tags: Option<bool>,
 }
 
 #[derive(

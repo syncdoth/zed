@@ -1057,6 +1057,15 @@
     // Choices: project_diff, file_diff, view_file
     // Default: project_diff
     "entry_primary_click_action": "project_diff",
+    // Which refs the git graph shows by default.
+    "git_graph": {
+      // Whether to show local branches in the git graph.
+      "show_local_branches": true,
+      // Whether to show remote branches in the git graph.
+      "show_remote_branches": true,
+      // Whether to show tags in the git graph.
+      "show_tags": true,
+    },
   },
   "agent": {
     // Whether the inline assistant should use streaming tools, when available

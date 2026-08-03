@@ -698,25 +698,125 @@ impl LogOrder {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// Selects which ref types a [`GraphRefFilter`] includes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphRefFilterOptions {
+    pub local_branches: bool,
+    pub remote_branches: bool,
+    pub tags: bool,
+}
+
+impl Default for GraphRefFilterOptions {
+    fn default() -> Self {
+        Self {
+            local_branches: true,
+            remote_branches: true,
+            tags: true,
+        }
+    }
+}
+
+/// Controls which refs the "all" git graph view is built from. Toggling a ref
+/// type off removes it from the git log roots, so commits only reachable through
+/// it disappear from the graph (matching VS Code's git graph behavior).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GraphRefFilter {
+    local_branches: bool,
+    remote_branches: bool,
+    tags: bool,
+    /// `None` = show all refs governed by the bools above.
+    /// `Some(refs)` = show only these explicit refs (an empty slice normalizes
+    /// back to the bool-driven behavior).
+    selected_refs: Option<Arc<[SharedString]>>,
+}
+
+impl GraphRefFilter {
+    /// Creates a filter. `selected_refs` is sorted and deduplicated before it
+    /// is stored, so the ordering supplied by the caller is discarded.
+    pub fn new(
+        options: GraphRefFilterOptions,
+        selected_refs: impl IntoIterator<Item = SharedString>,
+    ) -> Self {
+        let mut selected_refs = selected_refs.into_iter().collect::<Vec<_>>();
+        selected_refs.sort_unstable();
+        selected_refs.dedup();
+
+        Self {
+            local_branches: options.local_branches,
+            remote_branches: options.remote_branches,
+            tags: options.tags,
+            selected_refs: (!selected_refs.is_empty()).then(|| selected_refs.into()),
+        }
+    }
+
+    pub fn local_branches(&self) -> bool {
+        self.local_branches
+    }
+
+    pub fn remote_branches(&self) -> bool {
+        self.remote_branches
+    }
+
+    pub fn tags(&self) -> bool {
+        self.tags
+    }
+
+    pub fn selected_refs(&self) -> Option<&[SharedString]> {
+        self.selected_refs.as_deref()
+    }
+}
+
+impl Default for GraphRefFilter {
+    fn default() -> Self {
+        Self::new(GraphRefFilterOptions::default(), [])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LogSource {
-    #[default]
-    All,
+    All(GraphRefFilter),
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
 }
 
+impl Default for LogSource {
+    fn default() -> Self {
+        LogSource::All(GraphRefFilter::default())
+    }
+}
+
 impl LogSource {
     fn get_args(&self) -> Vec<Cow<'_, str>> {
         match self {
-            LogSource::All => vec![
-                Cow::Borrowed("--ignore-missing"), // needed in case of unborn HEAD
-                Cow::Borrowed("--branches"),
-                Cow::Borrowed("--remotes"),
-                Cow::Borrowed("--tags"),
-                Cow::Borrowed("HEAD"),
-            ],
+            LogSource::All(filter) => {
+                // A persisted selected ref can disappear before the graph reloads.
+                let mut args = vec![Cow::Borrowed("--ignore-missing")];
+                if let Some(refs) = filter.selected_refs() {
+                    args.push(Cow::Borrowed("--end-of-options"));
+                    args.extend(
+                        refs.iter()
+                            .map(|reference| Cow::Borrowed(reference.as_str())),
+                    );
+                    args.push(Cow::Borrowed("--"));
+                } else {
+                    if filter.local_branches() {
+                        args.push(Cow::Borrowed("--branches"));
+                    }
+                    if filter.remote_branches() {
+                        args.push(Cow::Borrowed("--remotes"));
+                    }
+                    if filter.tags() {
+                        args.push(Cow::Borrowed("--tags"));
+                    }
+                    if !filter.local_branches() && !filter.remote_branches() && !filter.tags() {
+                        args.extend([Cow::Borrowed("--not"), Cow::Borrowed("--all")]);
+                    } else if filter.local_branches() {
+                        args.push(Cow::Borrowed("HEAD"));
+                    }
+                }
+                args
+            }
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Path(path) => vec![
@@ -4108,6 +4208,106 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
 
+    #[test]
+    fn all_filter_args() {
+        let mk = |local, remote, tags, refs: Option<Vec<&str>>| {
+            GraphRefFilter::new(
+                GraphRefFilterOptions {
+                    local_branches: local,
+                    remote_branches: remote,
+                    tags,
+                },
+                refs.into_iter().flatten().map(SharedString::from),
+            )
+        };
+
+        // Everything on preserves the old default roots.
+        assert_eq!(
+            LogSource::All(mk(true, true, true, None)).get_args(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
+        );
+        // Tags off.
+        assert_eq!(
+            LogSource::All(mk(true, true, false, None)).get_args(),
+            vec!["--ignore-missing", "--branches", "--remotes", "HEAD"]
+        );
+        // Local only.
+        assert_eq!(
+            LogSource::All(mk(true, false, true, None)).get_args(),
+            vec!["--ignore-missing", "--branches", "--tags", "HEAD"]
+        );
+        // Hiding local branches also removes HEAD as a graph root.
+        assert_eq!(
+            LogSource::All(mk(false, true, true, None)).get_args(),
+            vec!["--ignore-missing", "--remotes", "--tags"]
+        );
+        // Explicit selection replaces every ref-type option.
+        assert_eq!(
+            LogSource::All(mk(true, true, true, Some(vec!["refs/heads/main"]))).get_args(),
+            vec![
+                "--ignore-missing",
+                "--end-of-options",
+                "refs/heads/main",
+                "--"
+            ]
+        );
+        // A ref name that begins with a dash is still passed as a revision.
+        assert_eq!(
+            LogSource::All(mk(true, true, true, Some(vec!["-branch"]))).get_args(),
+            vec!["--ignore-missing", "--end-of-options", "-branch", "--"]
+        );
+        // Empty selection normalizes to the ref-type filter.
+        assert_eq!(
+            LogSource::All(mk(true, true, false, Some(vec![]))).get_args(),
+            vec!["--ignore-missing", "--branches", "--remotes", "HEAD"]
+        );
+        // No selected ref type produces an empty graph rather than falling back to HEAD.
+        assert_eq!(
+            LogSource::All(mk(false, false, false, None)).get_args(),
+            vec!["--ignore-missing", "--not", "--all"]
+        );
+        // Default LogSource is All with everything on.
+        assert_eq!(
+            LogSource::default().get_args(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_ref_filter_normalizes_selected_refs() {
+        let first = GraphRefFilter::new(
+            GraphRefFilterOptions::default(),
+            ["origin/main", "main", "origin/main"].map(SharedString::from),
+        );
+        let second = GraphRefFilter::new(
+            GraphRefFilterOptions::default(),
+            ["main", "origin/main"].map(SharedString::from),
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .selected_refs()
+                .expect("non-empty selections are retained")
+                .iter()
+                .map(SharedString::as_str)
+                .collect::<Vec<_>>(),
+            vec!["main", "origin/main"]
+        );
+    }
+
     fn disable_git_global_config() {
         unsafe {
             std::env::set_var("GIT_CONFIG_GLOBAL", "");
@@ -6135,7 +6335,7 @@ mod tests {
 
         let graph_commits = async || {
             let (tx, rx) = smol::channel::unbounded();
-            repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
+            repo.initial_graph_data(LogSource::default(), LogOrder::DateOrder, tx)
                 .await
                 .unwrap();
             let mut commits = std::collections::HashSet::new();

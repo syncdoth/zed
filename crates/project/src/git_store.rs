@@ -37,9 +37,9 @@ use git::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
         CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
         FileHistoryChangedFileSets, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
-        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
-        delete_branch_flag,
+        GraphRefFilter, GraphRefFilterOptions, InitialGraphCommitData, LogOrder, LogSource,
+        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -5920,7 +5920,7 @@ impl Repository {
             RepositoryEvent::StashEntriesChanged => {
                 if self.scan_id > 2 {
                     self.initial_graph_data
-                        .retain(|(log_source, _), _| *log_source != LogSource::All);
+                        .retain(|(log_source, _), _| !matches!(log_source, LogSource::All(_)));
                 }
             }
             _ => {}
@@ -10151,7 +10151,15 @@ fn deserialize_blame_buffer_response(
 fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
     proto::GitLogSource {
         source: Some(match log_source {
-            LogSource::All => proto::git_log_source::Source::All(proto::GitLogSourceAll {}),
+            LogSource::All(filter) => proto::git_log_source::Source::All(proto::GitLogSourceAll {
+                local_branches: Some(filter.local_branches()),
+                remote_branches: Some(filter.remote_branches()),
+                tags: Some(filter.tags()),
+                selected_refs: filter
+                    .selected_refs()
+                    .map(|refs| refs.iter().map(|r| r.to_string()).collect())
+                    .unwrap_or_default(),
+            }),
             LogSource::Branch(branch) => proto::git_log_source::Source::Branch(branch.to_string()),
             LogSource::Sha(sha) => proto::git_log_source::Source::Sha(sha.to_string()),
             LogSource::Path(path) => {
@@ -10166,7 +10174,14 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         .source
         .context("git log source is missing source")?
     {
-        proto::git_log_source::Source::All(_) => Ok(LogSource::All),
+        proto::git_log_source::Source::All(all) => Ok(LogSource::All(GraphRefFilter::new(
+            GraphRefFilterOptions {
+                local_branches: all.local_branches.unwrap_or(true),
+                remote_branches: all.remote_branches.unwrap_or(true),
+                tags: all.tags.unwrap_or(true),
+            },
+            all.selected_refs.into_iter().map(Into::into),
+        ))),
         proto::git_log_source::Source::Branch(branch) => Ok(LogSource::Branch(branch.into())),
         proto::git_log_source::Source::Sha(sha) => Ok(LogSource::Sha(Oid::from_str(&sha)?)),
         proto::git_log_source::Source::Path(path) => {
@@ -10468,6 +10483,27 @@ mod tests {
         assert!(!is_submodule_git_dir(Path::new("/foo/.bare")));
         // A directory literally named `modules` that isn't under a git dir.
         assert!(!is_submodule_git_dir(Path::new("/Foo/modules/Bar")));
+    }
+
+    #[test]
+    fn log_source_from_proto_defaults_missing_ref_filter_fields() {
+        let source = log_source_from_proto(proto::GitLogSource {
+            source: Some(proto::git_log_source::Source::All(proto::GitLogSourceAll {
+                local_branches: None,
+                remote_branches: None,
+                tags: None,
+                selected_refs: Vec::new(),
+            })),
+        })
+        .expect("legacy log source should deserialize");
+
+        let LogSource::All(filter) = source else {
+            panic!("expected all log source");
+        };
+        assert!(filter.local_branches());
+        assert!(filter.remote_branches());
+        assert!(filter.tags());
+        assert_eq!(filter.selected_refs(), None);
     }
 
     #[gpui::test]
