@@ -10149,18 +10149,16 @@ fn deserialize_blame_buffer_response(
 fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
     proto::GitLogSource {
         source: Some(match log_source {
-            LogSource::All(filter) => {
-                proto::git_log_source::Source::All(proto::GitLogSourceAll {
-                    local_branches: filter.local_branches,
-                    remote_branches: filter.remote_branches,
-                    tags: filter.tags,
-                    selected_refs: filter
-                        .selected_refs
-                        .as_deref()
-                        .map(|refs| refs.iter().map(|r| r.to_string()).collect())
-                        .unwrap_or_default(),
-                })
-            }
+            LogSource::All(filter) => proto::git_log_source::Source::All(proto::GitLogSourceAll {
+                local_branches: filter.local_branches,
+                remote_branches: filter.remote_branches,
+                tags: filter.tags,
+                selected_refs: filter
+                    .selected_refs
+                    .as_deref()
+                    .map(|refs| refs.iter().map(|r| r.to_string()).collect())
+                    .unwrap_or_default(),
+            }),
             LogSource::Branch(branch) => proto::git_log_source::Source::Branch(branch.to_string()),
             LogSource::Sha(sha) => proto::git_log_source::Source::Sha(sha.to_string()),
             LogSource::Path(path) => {

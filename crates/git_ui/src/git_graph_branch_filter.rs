@@ -51,12 +51,9 @@ impl GitGraphBranchFilter {
             editor
         });
         let focus_handle = cx.focus_handle();
-        let _subscriptions = vec![cx.subscribe(
-            &query_editor,
-            |_, _, _: &EditorEvent, cx| {
-                cx.notify();
-            },
-        )];
+        let _subscriptions = vec![cx.subscribe(&query_editor, |_, _, _: &EditorEvent, cx| {
+            cx.notify();
+        })];
 
         Self {
             git_graph,
@@ -72,7 +69,12 @@ impl GitGraphBranchFilter {
         let selected_refs = if self.selected.is_empty() {
             None
         } else {
-            Some(self.selected.iter().cloned().collect::<Arc<[SharedString]>>())
+            Some(
+                self.selected
+                    .iter()
+                    .cloned()
+                    .collect::<Arc<[SharedString]>>(),
+            )
         };
         self.git_graph
             .update(cx, |git_graph, cx| {
@@ -94,7 +96,6 @@ impl GitGraphBranchFilter {
         self.apply(cx);
         cx.notify();
     }
-
 }
 
 impl EventEmitter<DismissEvent> for GitGraphBranchFilter {}

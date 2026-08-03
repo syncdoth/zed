@@ -748,7 +748,10 @@ impl LogSource {
                     .as_deref()
                     .filter(|refs| !refs.is_empty());
                 if let Some(refs) = selected {
-                    args.extend(refs.iter().map(|reference| Cow::Borrowed(reference.as_str())));
+                    args.extend(
+                        refs.iter()
+                            .map(|reference| Cow::Borrowed(reference.as_str())),
+                    );
                 } else {
                     if filter.local_branches {
                         args.push(Cow::Borrowed("--branches"));
@@ -4167,7 +4170,13 @@ mod tests {
         // Everything on (default behavior, preserves old args).
         assert_eq!(
             LogSource::All(mk(true, true, true, None)).get_args(),
-            vec!["--ignore-missing", "--branches", "--remotes", "--tags", "HEAD"]
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
         );
         // Tags off.
         assert_eq!(
@@ -4181,20 +4190,24 @@ mod tests {
         );
         // Explicit selection replaces branch/remote flags, tags still honored.
         assert_eq!(
-            LogSource::All(mk(true, true, true, Some(vec!["refs/heads/main"])))
-                .get_args(),
+            LogSource::All(mk(true, true, true, Some(vec!["refs/heads/main"]))).get_args(),
             vec!["--ignore-missing", "refs/heads/main", "--tags", "HEAD"]
         );
         // Empty selection normalizes to show-all (never blank).
         assert_eq!(
-            LogSource::All(mk(true, true, false, Some(vec![])))
-                .get_args(),
+            LogSource::All(mk(true, true, false, Some(vec![]))).get_args(),
             vec!["--ignore-missing", "--branches", "--remotes", "HEAD"]
         );
         // Default LogSource is All with everything on.
         assert_eq!(
             LogSource::default().get_args(),
-            vec!["--ignore-missing", "--branches", "--remotes", "--tags", "HEAD"]
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "HEAD"
+            ]
         );
     }
 

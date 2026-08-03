@@ -10,7 +10,6 @@ use crate::{
 use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
-use fs::Fs;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
@@ -33,12 +32,13 @@ use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{Picker, PickerDelegate};
 use project::{
-    ProjectPath,
+    Fs, ProjectPath,
     git_store::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
         RepositoryEvent, RepositoryId,
     },
 };
+use settings::{Settings as _, update_settings_file};
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
@@ -47,19 +47,12 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use zed_actions::{
-    buffer_search,
-    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
-};
-use settings::{Settings as _, update_settings_file};
-use task::{ResolvedTask, TaskContext, TaskVariables, VariableName};
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
+    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu,
     RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    ContextMenuEntry, PopoverMenu,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
@@ -69,6 +62,10 @@ use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
     notifications::DetachAndPromptErr,
+};
+use zed_actions::{
+    buffer_search,
+    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
 };
 
 #[derive(Copy, Clone)]
@@ -1393,7 +1390,12 @@ impl GitGraph {
     /// `%D` decoration name (e.g. `main` or `origin/main`); it is passed
     /// straight to `git checkout`, matching VS Code (a remote ref may land in
     /// detached HEAD depending on the local git version).
-    fn checkout_ref(&mut self, ref_name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn checkout_ref(
+        &mut self,
+        ref_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.get_repository(cx) else {
             return;
         };
@@ -1436,7 +1438,7 @@ impl GitGraph {
         let is_all = matches!(self.log_source, LogSource::All(_));
         PopoverMenu::new("git-graph-view-menu")
             .trigger(
-                IconButton::new("git-graph-view-menu-trigger", IconName::Sliders)
+                IconButton::new("git-graph-view-menu-trigger", IconName::Filter)
                     .shape(ui::IconButtonShape::Square)
                     .icon_size(IconSize::Small)
                     .disabled(!is_all)
@@ -1498,9 +1500,10 @@ impl GitGraph {
     /// The currently selected manual branch refs, if any.
     fn selected_refs(&self) -> Option<&Arc<[SharedString]>> {
         match &self.log_source {
-            LogSource::All(filter) => {
-                filter.selected_refs.as_ref().filter(|refs| !refs.is_empty())
-            }
+            LogSource::All(filter) => filter
+                .selected_refs
+                .as_ref()
+                .filter(|refs| !refs.is_empty()),
             _ => None,
         }
     }
@@ -1970,9 +1973,7 @@ impl GitGraph {
         if decoration.starts_with("tag: ") {
             return settings.show_tags;
         }
-        let branch = decoration
-            .strip_prefix("HEAD -> ")
-            .unwrap_or(decoration);
+        let branch = decoration.strip_prefix("HEAD -> ").unwrap_or(decoration);
         if branch == "HEAD" {
             return true;
         }
@@ -2036,8 +2037,7 @@ impl GitGraph {
         // Tags are not checkout targets; only branch/remote-branch chips get the
         // double-click-to-checkout handler.
         let is_branch = !name.starts_with("tag: ");
-        let chip_id =
-            SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
+        let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
         div()
             .id(chip_id)
             .child(chip)
@@ -4817,11 +4817,7 @@ mod persistence {
                     .log_source_value
                     .as_ref()
                     .filter(|v| !v.is_empty())
-                    .map(|v| {
-                        v.split('\n')
-                            .map(SharedString::from)
-                            .collect::<Arc<[_]>>()
-                    });
+                    .map(|v| v.split('\n').map(SharedString::from).collect::<Arc<[_]>>());
                 LogSource::All(GraphRefFilter {
                     selected_refs,
                     ..GraphRefFilter::default()
@@ -7185,7 +7181,7 @@ mod tests {
                 workspace,
                 repository.read(cx).id,
                 project.read(cx).git_store().clone(),
-                LogSource::All,
+                LogSource::All(GraphRefFilter::default()),
                 Some(first_sha.to_string()),
                 window,
                 cx,
@@ -7730,11 +7726,10 @@ mod tests {
     fn test_should_show_ref() {
         use crate::git_panel_settings::GitGraphSettings;
 
-        let remote_names: HashSet<String> =
-            ["origin/main", "origin/sam/audio_encoder"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let remote_names: HashSet<String> = ["origin/main", "origin/sam/audio_encoder"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let all = |local, remote, tags| GitGraphSettings {
             show_local_branches: local,
             show_remote_branches: remote,
