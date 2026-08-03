@@ -2358,6 +2358,11 @@ impl GitGraph {
     }
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        self.deselect_entry(cx);
+    }
+
+    /// Clears the current selection, which hides the commit changes panel.
+    fn deselect_entry(&mut self, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
@@ -3944,10 +3949,18 @@ impl GitGraph {
             focus_handle.focus(window, cx);
         }
 
-        self.select_entry(entry_idx, scroll_strategy, cx);
-
         if event.click_count() >= 2 {
+            self.select_entry(entry_idx, scroll_strategy, cx);
             self.open_commit_view(entry_idx, window, cx);
+            return;
+        }
+
+        // Single click toggles the changes panel: clicking the already-selected
+        // row again closes it.
+        if self.selected_entry_idx == Some(entry_idx) {
+            self.deselect_entry(cx);
+        } else {
+            self.select_entry(entry_idx, scroll_strategy, cx);
         }
     }
 
