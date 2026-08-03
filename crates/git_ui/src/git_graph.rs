@@ -3,6 +3,7 @@ use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
+    git_graph_branch_filter::GitGraphBranchFilter,
     git_panel_settings::GitPanelSettings,
     git_status_icon,
 };
@@ -13,8 +14,8 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, GraphRefFilter, GraphRefFilterOptions, InitialGraphCommitData,
-        LogOrder, LogSource, RepoPath, SearchCommitArgs,
+        Branch, CommitDiff, CommitFile, GraphRefFilter, GraphRefFilterOptions,
+        InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -34,7 +35,7 @@ use project::{
     Fs, ProjectPath,
     git_store::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
-        RepositoryEvent, RepositoryId,
+        RepositoryEvent, RepositoryId, RepositorySnapshot,
     },
 };
 use settings::{Settings as _, update_settings_file};
@@ -1409,7 +1410,7 @@ impl GitGraph {
 
     /// The "View Options" menu in the toolbar toggles which ref types the graph
     /// shows. It is disabled when not in the `All` view (e.g. file history).
-    fn render_view_menu(&self) -> impl IntoElement {
+    fn render_view_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let is_all = matches!(self.log_source, LogSource::All(_));
         PopoverMenu::new("git-graph-view-menu")
             .trigger(
@@ -1454,7 +1455,169 @@ impl GitGraph {
             })
             .anchor(Anchor::TopRight)
     }
+    /// Replaces the manual branch selection on the `All`-view filter and
+    /// reloads the graph. `None` means "show all".
+    pub(crate) fn apply_branch_selection(
+        &mut self,
+        selected_refs: Option<Arc<[SharedString]>>,
+        cx: &mut Context<Self>,
+    ) {
+        let LogSource::All(filter) = &self.log_source else {
+            return;
+        };
+        let next = GraphRefFilter::new(
+            GraphRefFilterOptions {
+                local_branches: filter.local_branches(),
+                remote_branches: filter.remote_branches(),
+                tags: filter.tags(),
+            },
+            selected_refs.as_deref().into_iter().flatten().cloned(),
+        );
+        self.set_log_source(LogSource::All(next), cx);
+    }
 
+    /// The currently selected manual branch refs, if any.
+    fn selected_refs(&self) -> Option<&[SharedString]> {
+        match &self.log_source {
+            LogSource::All(filter) => filter.selected_refs(),
+            _ => None,
+        }
+    }
+
+    fn normalize_log_source(log_source: LogSource, repository: &RepositorySnapshot) -> LogSource {
+        let LogSource::All(filter) = log_source else {
+            return log_source;
+        };
+
+        if repository.scan_id == 0
+            || repository.branch_list_error.is_some()
+            || repository.branch_list.is_empty()
+        {
+            return LogSource::All(filter);
+        }
+
+        let selected = filter
+            .selected_refs()
+            .map(|refs| {
+                refs.iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let normalized =
+            GitGraphBranchFilter::normalize_selected_refs(&repository.branch_list, &selected);
+        if normalized == selected {
+            return LogSource::All(filter);
+        }
+
+        LogSource::All(GraphRefFilter::new(
+            GraphRefFilterOptions {
+                local_branches: filter.local_branches(),
+                remote_branches: filter.remote_branches(),
+                tags: filter.tags(),
+            },
+            normalized,
+        ))
+    }
+
+    fn normalize_branch_selection(
+        &mut self,
+        repository: &RepositorySnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let next = Self::normalize_log_source(self.log_source.clone(), repository);
+        if next != self.log_source {
+            self.set_log_source(next, cx);
+        }
+    }
+
+    /// Label for the "Branches" dropdown trigger, reflecting the current
+    /// selection.
+    fn branch_dropdown_label(&self) -> SharedString {
+        match self.selected_refs() {
+            None => "All branches".into(),
+            Some([ref_name]) => ref_name
+                .strip_prefix("refs/heads/")
+                .or_else(|| ref_name.strip_prefix("refs/remotes/"))
+                .unwrap_or(ref_name)
+                .into(),
+            Some(refs) => format!("{} branches", refs.len()).into(),
+        }
+    }
+
+    /// Collects branch multi-select data from the repository's cached branch
+    /// list, retaining selected refs when their ref type is hidden.
+    fn branch_filter_data(
+        &self,
+        cx: &App,
+    ) -> (
+        Vec<Branch>,
+        std::collections::HashSet<SharedString>,
+        bool,
+        bool,
+    ) {
+        let settings = GitPanelSettings::get_global(cx).git_graph;
+        let selected: std::collections::HashSet<SharedString> = self
+            .selected_refs()
+            .map(|refs| refs.iter().cloned().collect())
+            .unwrap_or_default();
+        let branches = self
+            .get_repository(cx)
+            .map(|repo| {
+                repo.read(cx)
+                    .branch_list
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        (
+            branches,
+            selected,
+            settings.show_local_branches,
+            settings.show_remote_branches,
+        )
+    }
+
+    /// The "Branches" dropdown in the toolbar. Disabled outside the `All` view.
+    fn render_branch_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_all = matches!(self.log_source, LogSource::All(_));
+        let label = self.branch_dropdown_label();
+        let this = cx.entity();
+        let weak_self = this.downgrade();
+        PopoverMenu::new("git-graph-branch-dropdown")
+            .trigger(
+                Button::new("git-graph-branch-dropdown-trigger", label)
+                    .start_icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(!is_all),
+            )
+            .menu(move |window, cx| {
+                if !is_all {
+                    return None;
+                }
+                let (branches, selected, show_local_branches, show_remote_branches) =
+                    this.read_with(cx, |this, cx| this.branch_filter_data(cx));
+                let weak_self = weak_self.clone();
+                Some(cx.new(|cx| {
+                    GitGraphBranchFilter::new(
+                        weak_self,
+                        branches,
+                        selected,
+                        show_local_branches,
+                        show_remote_branches,
+                        window,
+                        cx,
+                    )
+                }))
+            })
+            .anchor(Anchor::TopRight)
+    }
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -1573,6 +1736,11 @@ impl GitGraph {
             }
             other => other,
         };
+        let repository = git_store.read(cx).repositories().get(&repo_id).cloned();
+        let log_source = repository
+            .as_ref()
+            .map(|repository| Self::normalize_log_source(log_source.clone(), repository.read(cx)))
+            .unwrap_or(log_source);
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
@@ -1792,6 +1960,10 @@ impl GitGraph {
                 }
             }
             RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+                if matches!(event, RepositoryEvent::BranchListChanged) {
+                    let repository_snapshot = repository.read(cx).snapshot();
+                    self.normalize_branch_selection(&repository_snapshot, cx);
+                }
                 // Only invalidate if we scanned atleast once,
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
@@ -2863,7 +3035,8 @@ impl GitGraph {
                             ),
                     ),
             )
-            .child(self.render_view_menu())
+            .child(self.render_branch_dropdown(cx))
+            .child(self.render_view_menu(cx))
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -6121,6 +6294,43 @@ mod tests {
             persistence::deserialize_log_order(&empty_state),
             LogOrder::DateOrder
         ));
+    }
+
+    #[test]
+    fn test_selected_refs_round_trip() {
+        use persistence::SerializedGitGraphState;
+
+        let selected_refs = vec![
+            SharedString::from("main"),
+            SharedString::from("origin/main"),
+        ];
+        let source = LogSource::All(GraphRefFilter::new(true, true, true, selected_refs.clone()));
+
+        let state = SerializedGitGraphState {
+            log_source_type: Some(persistence::serialize_log_source_type(&source)),
+            log_source_value: persistence::serialize_log_source_value(&source),
+            ..Default::default()
+        };
+
+        match persistence::deserialize_log_source(&state) {
+            LogSource::All(filter) => assert_eq!(
+                filter.selected_refs(),
+                Some(selected_refs.as_slice()),
+                "selected branch refs should survive serialization"
+            ),
+            other => panic!("expected All, got {other:?}"),
+        }
+
+        // An `All` source with no selection persists nothing and restores to the
+        // default filter.
+        let no_selection = LogSource::All(GraphRefFilter::default());
+        assert_eq!(persistence::serialize_log_source_value(&no_selection), None);
+        let state = SerializedGitGraphState {
+            log_source_type: Some(persistence::serialize_log_source_type(&no_selection)),
+            log_source_value: None,
+            ..Default::default()
+        };
+        assert_eq!(persistence::deserialize_log_source(&state), no_selection);
     }
 
     #[gpui::test]
