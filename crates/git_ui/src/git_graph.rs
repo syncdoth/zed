@@ -2187,14 +2187,22 @@ impl GitGraph {
         let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
         div()
             .min_w_0()
-            .id(chip_id)
+            .id(chip_id.clone())
+            .debug_selector(move || chip_id.to_string())
             .child(chip)
+            .when(is_branch, |chip| {
+                chip.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+            })
             .on_click(cx.listener({
                 let ref_name = ref_name.clone();
                 move |this, event: &ClickEvent, window, cx| {
-                    if is_branch && event.click_count() >= 2 {
+                    if is_branch {
                         cx.stop_propagation();
-                        this.checkout_ref(ref_name.clone(), window, cx);
+                        if event.click_count() >= 2 {
+                            this.checkout_ref(ref_name.clone(), window, cx);
+                        }
                     }
                 }
             }))
@@ -2394,6 +2402,10 @@ impl GitGraph {
 
     /// Clears the current selection, which hides the commit changes panel.
     fn deselect_entry(&mut self, cx: &mut Context<Self>) {
+        self.clear_selection(cx);
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_entry_idx = None;
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
@@ -3986,11 +3998,7 @@ impl GitGraph {
             return;
         }
 
-        // Single click toggles the changes panel: clicking the already-selected
-        // row again closes it.
-        if self.selected_entry_idx == Some(entry_idx) {
-            self.deselect_entry(cx);
-        } else {
+        if self.selected_entry_idx != Some(entry_idx) {
             self.select_entry(entry_idx, scroll_strategy, cx);
         }
     }
@@ -5214,7 +5222,10 @@ mod tests {
     use fs::FakeFs;
     use git::Oid;
     use git::repository::{CommitData, InitialGraphCommitData};
-    use gpui::{TestAppContext, UpdateGlobal};
+    use gpui::{
+        ClickEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseUpEvent, PlatformInput,
+        TestAppContext, UpdateGlobal,
+    };
     use project::git_store::{GitStoreEvent, RepositoryEvent};
     use project::{
         GIT_COMMAND_TASK_TAG, Project, TaskSourceKind, task_store::TaskSettingsLocation,
@@ -5234,6 +5245,21 @@ mod tests {
             language_model::init(cx);
             crate::init(cx);
         });
+    }
+
+    fn mouse_click_event(click_count: usize) -> ClickEvent {
+        ClickEvent::Mouse(MouseClickEvent {
+            down: MouseDownEvent {
+                button: MouseButton::Left,
+                click_count,
+                ..Default::default()
+            },
+            up: MouseUpEvent {
+                button: MouseButton::Left,
+                click_count,
+                ..Default::default()
+            },
+        })
     }
 
     fn build_oid_to_row_map(graph: &GraphData) -> HashMap<Oid, usize> {
@@ -7919,6 +7945,9 @@ mod tests {
                 cx,
             )
         });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
         cx.run_until_parked();
 
         let head = repository.read_with(cx, |repo, _| {
@@ -7926,8 +7955,79 @@ mod tests {
         });
         assert_eq!(head.as_deref(), Some("main"));
 
-        git_graph.update_in(cx, |git_graph, window, cx| {
-            git_graph.checkout_ref("feature-x".into(), window, cx);
+        let mut chip_position = cx
+            .debug_bounds("git-graph-ref-chip-0-feature-x")
+            .expect("feature branch chip should be rendered")
+            .center();
+
+        git_graph.update_in(cx, |git_graph, _, _| {
+            git_graph.selected_entry_idx = Some(0);
+        });
+
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    position: chip_position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position: chip_position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |git_graph, _| {
+            assert_eq!(
+                git_graph.selected_entry_idx,
+                Some(0),
+                "clicking a branch chip should not toggle commit details"
+            );
+        });
+
+        chip_position = cx
+            .debug_bounds("git-graph-ref-chip-0-feature-x")
+            .expect("feature branch chip should still be rendered")
+            .center();
+
+        cx.update(|window, cx| {
+            for click_count in [1, 2] {
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        position: chip_position,
+                        button: MouseButton::Left,
+                        click_count,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        position: chip_position,
+                        button: MouseButton::Left,
+                        click_count,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            }
+        });
+
+        git_graph.read_with(&*cx, |git_graph, _| {
+            assert_eq!(
+                git_graph.selected_entry_idx,
+                Some(0),
+                "clicking a branch chip should not toggle commit details"
+            );
         });
         cx.run_until_parked();
 
@@ -7939,6 +8039,159 @@ mod tests {
             Some("feature-x"),
             "double-click checkout should switch the current branch"
         );
+    }
+
+    #[gpui::test]
+    async fn test_double_click_row_does_not_toggle_details(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let commit_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("commit SHA should be valid");
+        let parent_sha = Oid::try_from("1234567890abcdef1234567890abcdef12345678")
+            .expect("parent SHA should be valid");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: commit_sha,
+                    parents: smallvec![parent_sha],
+                    ref_names: Vec::new(),
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: parent_sha,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            ],
+        );
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [
+                (
+                    CommitData {
+                        sha: commit_sha,
+                        parents: smallvec![parent_sha],
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 1,
+                        subject: "Commit subject".into(),
+                        message: "Commit message".into(),
+                    },
+                    false,
+                ),
+                (
+                    CommitData {
+                        sha: parent_sha,
+                        parents: SmallVec::new(),
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 2,
+                        subject: "Parent subject".into(),
+                        message: "Parent message".into(),
+                    },
+                    false,
+                ),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let workspace_weak = workspace.downgrade();
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |git_graph, window, cx| {
+            git_graph.selected_entry_idx = Some(0);
+
+            git_graph.handle_entry_click(
+                0,
+                &mouse_click_event(1),
+                ScrollStrategy::Center,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                git_graph.selected_entry_idx,
+                Some(0),
+                "clicking the selected row should not close commit details"
+            );
+
+            git_graph.handle_entry_click(
+                1,
+                &mouse_click_event(1),
+                ScrollStrategy::Center,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                git_graph.selected_entry_idx,
+                Some(1),
+                "clicking a different row should select it immediately"
+            );
+
+            git_graph.handle_entry_click(
+                1,
+                &mouse_click_event(1),
+                ScrollStrategy::Center,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(
+                git_graph.selected_entry_idx,
+                Some(1),
+                "clicking the selected row should not close commit details"
+            );
+
+            git_graph.handle_entry_click(
+                1,
+                &mouse_click_event(2),
+                ScrollStrategy::Center,
+                None,
+                window,
+                cx,
+            );
+            assert_eq!(git_graph.selected_entry_idx, Some(1));
+        });
+        cx.run_until_parked();
     }
 
     #[test]
